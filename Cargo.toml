@@ -1,0 +1,29 @@
+[package]
+name = "lc_deck"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "LC-Deck —— 局域网远控工具（类 ToDesk，仅限本地局域网）"
+license = "MIT"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+xcap = "0.9"
+enigo = "0.6"
+arboard = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.10"
+dirs = "7"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+socket2 = { version = "0.6", features = ["all"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

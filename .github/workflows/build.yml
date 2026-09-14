@@ -1,0 +1,70 @@
+# GitHub Actions：macOS / Windows 双平台构建与打包。
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          NAME="lc_deck-v${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/lc_deck" "dist/${NAME}/"
+          cp README.md "dist/${NAME}/" || true
+          cd dist && tar czf "${NAME}.tar.gz" "${NAME}" && cd ..
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+                      ForEach-Object { $_.Matches[0].Groups[1].Value })
+          $NAME = "lc_deck-v$VERSION-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$NAME" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/lc_deck.exe" "dist/$NAME/"
+          Copy-Item README.md "dist/$NAME/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "dist/$NAME" -DestinationPath "dist/$NAME.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lc_deck-${{ matrix.target }}
+          path: dist/*
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
