@@ -80,15 +80,46 @@ impl InputExecutor {
             return Ok(());
         }
 
-        let key = if let Some(c) = keys::name_to_char(name) {
-            Key::Unicode(c)
-        } else {
-            match name_to_enigo_key(name) {
-                Some(k) => k,
-                None => {
-                    log::debug!("忽略未知按键名: {name}");
+        if let Some(c) = keys::name_to_char(name) {
+            // 文本字符注入。macOS 上 Key::Unicode 会调用 TIS/TSM 键盘布局接口
+            // （强制主线程，在会话线程调用直接 SIGTRAP 崩溃），因此全部改走
+            // 线程安全的 CGEvent 路径：
+            //   · 无修饰键 → fast_text（SetUnicodeString，支持大小写/中文/任意布局）
+            //   · 按住修饰键 → raw(US 物理键码)，enigo 的 event_flags 自动携带
+            //     已按住的 Command/Shift 等，Command+C 等快捷键正常
+            // fast_text 注入是原子的：只处理按下，忽略抬起。
+            if cfg!(target_os = "macos") {
+                if self.pressed_mods.is_empty() {
+                    if k.down {
+                        return match self.enigo.fast_text(&c.to_string()).map_err(es)? {
+                            Some(()) => Ok(()),
+                            None => Err("文本注入不可用".into()),
+                        };
+                    }
                     return Ok(());
                 }
+                return match char_to_mac_keycode(c) {
+                    Some(code) => {
+                        let dir = if k.down { Direction::Press } else { Direction::Release };
+                        self.enigo.raw(code, dir).map_err(es)
+                    }
+                    None => {
+                        if k.down {
+                            let _ = self.enigo.fast_text(&c.to_string());
+                        }
+                        Ok(())
+                    }
+                };
+            }
+            let dir = if k.down { Direction::Press } else { Direction::Release };
+            return self.enigo.key(Key::Unicode(c), dir).map_err(es);
+        }
+
+        let key = match name_to_enigo_key(name) {
+            Some(k) => k,
+            None => {
+                log::debug!("忽略未知按键名: {name}");
+                return Ok(());
             }
         };
         let dir = if k.down { Direction::Press } else { Direction::Release };
@@ -167,4 +198,32 @@ fn name_to_enigo_key(name: &str) -> Option<Key> {
 
 fn es(e: enigo::InputError) -> String {
     format!("注入输入失败: {e:?}")
+}
+
+/// macOS 虚拟键码（Apple US ANSI 布局）。仅在按住修饰键时用于快捷键注入：
+/// 此路径不查询键盘布局（无 TIS 调用），符号依赖 US 布局物理位置。
+#[cfg(target_os = "macos")]
+fn char_to_mac_keycode(c: char) -> Option<u16> {
+    let code: u16 = match c.to_ascii_lowercase() {
+        'a' => 0x00, 's' => 0x01, 'd' => 0x02, 'f' => 0x03,
+        'h' => 0x04, 'g' => 0x05, 'z' => 0x06, 'x' => 0x07,
+        'c' => 0x08, 'v' => 0x09, 'b' => 0x0B, 'q' => 0x0C,
+        'w' => 0x0D, 'e' => 0x0E, 'r' => 0x0F, 'y' => 0x10,
+        't' => 0x11, '1' => 0x12, '2' => 0x13, '3' => 0x14,
+        '4' => 0x15, '6' => 0x16, '5' => 0x17, '=' => 0x18,
+        '9' => 0x19, '7' => 0x1A, '-' => 0x1B, '8' => 0x1C,
+        '0' => 0x1D, ']' => 0x1E, 'o' => 0x1F, 'u' => 0x20,
+        '[' => 0x21, 'i' => 0x22, 'p' => 0x23, 'l' => 0x25,
+        'j' => 0x26, '\'' => 0x27, 'k' => 0x28, ';' => 0x29,
+        '\\' => 0x2A, ',' => 0x2B, '/' => 0x2C, 'n' => 0x2D,
+        'm' => 0x2E, '.' => 0x2F, '`' => 0x32,
+        ' ' => 0x31, '\n' => 0x24, '\t' => 0x30,
+        _ => return None,
+    };
+    Some(code)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn char_to_mac_keycode(_c: char) -> Option<u16> {
+    None
 }
