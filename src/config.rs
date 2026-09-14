@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-pub const DEFAULT_FPS: u32 = 15;
+pub const DEFAULT_FPS: u32 = 24;
 pub const DEFAULT_QUALITY: u8 = 70;
 pub const DEFAULT_MAX_WIDTH: u32 = 1920;
 

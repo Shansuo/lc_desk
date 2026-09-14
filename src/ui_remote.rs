@@ -88,7 +88,8 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
 
             let response = ui.allocate_rect(rect, Sense::click_and_drag());
             if response.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                // 用系统箭头光标代表远端鼠标：本地 OS 渲染，零延迟、无重影
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
             }
 
             handle_input(ui, session, rect, tex_size);

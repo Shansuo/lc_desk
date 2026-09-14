@@ -61,13 +61,21 @@ fn run_capture(cfg: CaptureConfig, tx: FrameTx, stop: Arc<AtomicBool>, on_error:
         .spawn(move || encode_loop(cfg, raw_rx, tx, enc_stop))
         .expect("spawn capture-encoder");
 
-    // 首选推模式（ScreenCaptureKit / DXGI 桌面复制），失败则退回轮询截图
-    match try_recorder_loop(&monitor, cfg, &raw_tx, &stop) {
-        Ok(()) => {}
-        Err(e) => {
+    // 首选推模式（DXGI/WGC 桌面复制）。注意：macOS 的 VideoRecorder 会把远端
+    // 光标烧进画面（xcap 硬编码 setCapturesCursor(true)），导致控制端出现
+    // 「画面内慢速光标 + 本地快速光标」双光标，因此 macOS 直接用轮询截图
+    // （CGWindowListCreateImage，不含光标），由控制端本地光标唯一代表位置。
+    let use_recorder = !cfg!(target_os = "macos");
+    let result = if use_recorder {
+        try_recorder_loop(&monitor, cfg, &raw_tx, &stop)
+    } else {
+        Err(anyhow::anyhow!("macOS 固定使用无光标的轮询捕获"))
+    };
+    if let Err(e) = result {
+        if use_recorder {
             log::warn!("推模式捕获不可用（{e}），退回轮询截图模式");
-            poll_capture_loop(&monitor, cfg, &raw_tx, stop, on_error);
         }
+        poll_capture_loop(&monitor, cfg, &raw_tx, stop, on_error);
     }
     drop(raw_tx);
     let _ = encoder.join();

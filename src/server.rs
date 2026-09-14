@@ -219,8 +219,8 @@ fn run_session(
         view_only: AtomicBool::new(view_only),
     });
 
-    // 帧通道（有界，防积压）
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(2);
+    // 帧通道（有界，最新帧优先：容量 1，编码完成即替换，避免排队积压延迟）
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(1);
     let cap_cfg = {
         let cfg = shared.config.lock().unwrap();
         CaptureConfig { fps: cfg.fps, jpeg_quality: cfg.jpeg_quality, max_width: cfg.max_width }
@@ -247,9 +247,13 @@ fn run_session(
         .name("lc-conn-writer".into())
         .spawn(move || {
             while !writer_stop.load(Ordering::Relaxed) {
-                // 先发帧（带 50ms 等待），再穿插控制消息
+                // 先发帧（带 50ms 等待）。收到后清空通道取最新帧，避免发送排队旧帧。
                 match frame_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok((w, h, jpeg)) => {
+                    Ok(mut latest) => {
+                        while let Ok(newer) = frame_rx.try_recv() {
+                            latest = newer;
+                        }
+                        let (w, h, jpeg) = latest;
                         if protocol::write_msg(
                             &mut writer,
                             &Msg::VideoFrame { width: w, height: h, jpeg },
