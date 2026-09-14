@@ -105,6 +105,12 @@ pub fn open_accessibility_permission_settings() {
         .spawn();
 }
 
+/// 非 macOS 平台无系统权限面板可开。
+#[cfg(not(target_os = "macos"))]
+pub fn open_screen_permission_settings() {}
+#[cfg(not(target_os = "macos"))]
+pub fn open_accessibility_permission_settings() {}
+
 /// 为 egui 安装 CJK 字体（macOS/Windows/Linux 的系统字体），保证中文正常渲染。
 pub fn install_cjk_fonts(ctx: &egui::Context) {
     let candidates: &[&str] = if cfg!(target_os = "macos") {
