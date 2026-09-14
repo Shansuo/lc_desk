@@ -381,33 +381,39 @@ impl App {
             }
             ui.separator();
             ui.label("帧率：");
-            ui.add(egui::Slider::new(&mut fps, 5..=30).suffix(" fps"));
+            let r_fps = ui.add(egui::Slider::new(&mut fps, 5..=30).suffix(" fps"));
             ui.label("画质：");
-            ui.add(egui::Slider::new(&mut jpeg_quality, 30..=95));
+            let r_q = ui.add(egui::Slider::new(&mut jpeg_quality, 30..=95));
+            if r_fps.changed() {
+                self.shared.config.lock().unwrap().fps = fps;
+            }
+            if r_q.changed() {
+                self.shared.config.lock().unwrap().jpeg_quality = jpeg_quality;
+            }
+            if r_fps.drag_stopped() || r_q.drag_stopped() {
+                self.save_config();
+            }
         });
         ui.horizontal(|ui| {
             ui.label("画面最大宽度：");
-            ui.add(egui::Slider::new(&mut max_width, 1280..=3840).suffix(" px"));
+            let r_w = ui.add(egui::Slider::new(&mut max_width, 1280..=3840).suffix(" px"));
+            if r_w.changed() {
+                self.shared.config.lock().unwrap().max_width = max_width;
+            }
+            if r_w.drag_stopped() {
+                self.save_config();
+                self.shared.notify("画面参数已保存并实时生效");
+            }
             ui.separator();
             if ui.checkbox(&mut ctrl_as_cmd, "被控(macOS)时 Ctrl 映射为 Command").changed() {
                 self.shared.config.lock().unwrap().ctrl_as_cmd = ctrl_as_cmd;
+                self.save_config();
             }
             if ui.checkbox(&mut sync_clipboard, "会话中同步剪贴板").changed() {
                 self.shared.config.lock().unwrap().sync_clipboard = sync_clipboard;
+                self.save_config();
             }
         });
-        if ui.button("应用画质/帧率设置").clicked() {
-            {
-                let mut cfg = self.shared.config.lock().unwrap();
-                cfg.fps = fps;
-                cfg.jpeg_quality = jpeg_quality;
-                cfg.max_width = max_width;
-                cfg.ctrl_as_cmd = ctrl_as_cmd;
-                cfg.sync_clipboard = sync_clipboard;
-            }
-            self.save_config();
-            self.shared.notify("画质与帧率设置已保存（对下一个新会话生效）");
-        }
     }
 
     fn show_request_dialogs(&mut self, ctx: &egui::Context) {

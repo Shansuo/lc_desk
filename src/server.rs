@@ -1,6 +1,6 @@
 //! 被控端：TCP 监听、握手鉴权、本机确认、屏幕流发送、输入执行、剪贴板同步。
 
-use crate::capture::{self, CaptureConfig};
+use crate::capture::{self};
 use crate::input_exec::InputExecutor;
 use crate::protocol::{self, Msg};
 use crate::state::{tune_stream, AppShared, ControlledSession, UiEvent};
@@ -221,14 +221,11 @@ fn run_session(
 
     // 帧通道（有界，最新帧优先：容量 1，编码完成即替换，避免排队积压延迟）
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(1);
-    let cap_cfg = {
-        let cfg = shared.config.lock().unwrap();
-        CaptureConfig { fps: cfg.fps, jpeg_quality: cfg.jpeg_quality, max_width: cfg.max_width }
-    };
+    // 传配置句柄而非快照：用户在设置里调整帧率/画质/宽度可实时生效
     let cap_stop = stop.clone();
     let notify = shared.clone();
     let capture_handle = capture::spawn_capture(
-        cap_cfg,
+        shared.config.clone(),
         frame_tx,
         cap_stop,
         Box::new(move |text| notify.notify(text)),
