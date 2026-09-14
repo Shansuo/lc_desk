@@ -263,6 +263,20 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _te
                     send_key(session, name, pressed);
                 }
             }
+            Event::Ime(egui::ImeEvent::Commit(text)) => {
+                // 本地输入法（中文/日文等）组合完成：逐字符经现有 KeyMsg
+                // 通道注入被控端（被控端 v0.1.2+ 对单字符走 fast_text，
+                // 线程安全且支持任意 Unicode）。不改协议，兼容旧版对端。
+                for ch in text.chars() {
+                    if ch == ' ' {
+                        send_key(session, "space", true);
+                        send_key(session, "space", false);
+                    } else {
+                        send_key(session, &ch.to_string(), true);
+                        send_key(session, &ch.to_string(), false);
+                    }
+                }
+            }
             Event::ModifiersChanged(m) => {
                 sync_mods(session, &m);
             }
@@ -275,6 +289,18 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _te
     if !focused {
         sync_mods(session, &Modifiers::NONE);
     }
+
+    // 声明 IME 激活（锚定在画面区）。eframe 依据 output.ime 是否为 Some
+    // 来调用窗口 set_ime_allowed：不声明则系统在「无文本框」的窗口里
+    // 直接屏蔽输入法切换（Ctrl+空格/Win+空格失效），无法输入中文。
+    ui.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput {
+            purpose: egui::IMEPurpose::Normal,
+            rect,
+            cursor_rect: Rect::from_min_size(rect.center(), Vec2::new(1.0, 16.0)),
+            should_interrupt_composition: false,
+        })
+    });
 }
 
 /// 按当前修饰键状态同步到被控端：按下发 down、松开发 up（内部去重）。
