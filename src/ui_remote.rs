@@ -218,13 +218,26 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _te
                         }
                         continue;
                     }
+                    if ch == ' ' {
+                        continue; // 空格走 Event::Key{Space}，避免双发
+                    }
+                    // 大写锁定归一化：字符是大写但本地没按 Shift，说明来自
+                    // Caps Lock。直接转发大写字母会让被控端（尤其 macOS 拼音
+                    // 输入法不识别大写字母）无法组句。转小写发送；
+                    // 要真正的大写请用 Shift+字母（此时 shift 已另行转发）。
+                    let ch = if ch.is_alphabetic() && ch.is_uppercase() && !mods.shift {
+                        ch.to_lowercase().next().unwrap_or(ch)
+                    } else {
+                        ch
+                    };
                     let s = ch.to_string();
                     send_key(session, &s, true);
                     send_key(session, &s, false);
                 }
             }
-            Event::Key { key, pressed, modifiers, .. } => {
-                // 复制/粘贴/剪切被 egui 拦截，这里还原为快捷键
+            Event::Key { key, pressed, .. } => {
+                // 复制/粘贴/剪切被 egui 拦截成合成事件，还原为字母键
+                //（修饰键状态已由 ModifiersChanged 同步到被控端）。
                 match key {
                     Key::Copy | Key::Cut | Key::Paste => {
                         let ch = match key {
@@ -232,10 +245,8 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _te
                             Key::Cut => 'x',
                             _ => 'v',
                         };
-                        send_mods(session, &modifiers, true);
                         send_key(session, &ch.to_string(), true);
                         send_key(session, &ch.to_string(), false);
-                        send_mods(session, &modifiers, false);
                         continue;
                     }
                     _ => {}
@@ -244,38 +255,45 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _te
                     if keys::is_modifier_name(name) {
                         continue; // 修饰键统一走 ModifiersChanged
                     }
+                    // 数字/符号键会同时触发 Event::Text（真实字符），
+                    // 由 Text 路径注入即可；这里跳过，防止一次按键重复注入。
+                    if keys::name_to_char(name).is_some() {
+                        continue;
+                    }
                     send_key(session, name, pressed);
                 }
-                let _ = modifiers;
             }
             Event::ModifiersChanged(m) => {
-                send_mods(session, &m, true);
+                sync_mods(session, &m);
             }
             _ => {}
         }
     }
-    let _ = mods;
+    // 失焦兜底：本窗口失焦时不会收到修饰键抬起事件，主动释放，
+    // 否则被控端会残留 Shift/Ctrl 卡键（大写卡死、组合键错乱）。
+    let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
+    if !focused {
+        sync_mods(session, &Modifiers::NONE);
+    }
 }
 
-/// 按当前修饰键状态发送按下/释放（内部去重）。
-fn send_mods(session: &Arc<RemoteSession>, m: &Modifiers, down: bool) {
-    let want = [
-        m.ctrl,
-        m.alt,
-        m.shift,
-        m.mac_cmd || (m.command && !m.ctrl && !cfg!(target_os = "macos")),
-    ];
+/// 按当前修饰键状态同步到被控端：按下发 down、松开发 up（内部去重）。
+/// 此前版本有 bug：释放时误发了 down，导致被控端修饰键永久卡住。
+fn sync_mods(session: &Arc<RemoteSession>, m: &Modifiers) {
+    let want = [m.ctrl, m.alt, m.shift, m.mac_cmd || m.command];
     let names = ["ctrl", "alt", "shift", "super"];
     let mut st = session.ui_state.lock().unwrap();
     for i in 0..4 {
-        if want[i] != st.last_mods[i] {
-            st.last_mods[i] = want[i];
-            drop(st);
-            let _ = session
-                .input_tx
-                .send(OutMsg::Key(crate::protocol::KeyMsg { key: names[i].into(), down }));
-            st = session.ui_state.lock().unwrap();
+        if want[i] == st.last_mods[i] {
+            continue;
         }
+        st.last_mods[i] = want[i];
+        let down = want[i];
+        drop(st);
+        let _ = session
+            .input_tx
+            .send(OutMsg::Key(crate::protocol::KeyMsg { key: names[i].into(), down }));
+        st = session.ui_state.lock().unwrap();
     }
 }
 

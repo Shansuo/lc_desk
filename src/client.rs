@@ -60,6 +60,10 @@ pub struct RemoteUiState {
 }
 
 impl RemoteSession {
+    pub fn viewport_id(&self) -> egui::ViewportId {
+        egui::ViewportId(egui::Id::new(("remote", self.id)))
+    }
+
     pub fn disconnect(&self, reason: &str) {
         if !self.closed.swap(true, Ordering::Relaxed) {
             let _ = self.input_tx.send(OutMsg::Bye(reason.to_string()));
@@ -209,7 +213,10 @@ fn try_connect(
                                 frame_times.push(now);
                                 stats.fps = frame_times.len() as f32 / 2.0;
                                 drop(stats);
-                                ctx.request_repaint();
+                                // 注意：request_repaint() 只重绘当前视口（后台线程为 ROOT），
+                                // 远控画面在独立视口，必须定向请求重绘，
+                                // 否则画面要等用户碰窗口才更新。
+                                ctx.request_repaint_of(session.viewport_id());
                             }
                         }
                         Ok(Msg::Pong(p)) => {
