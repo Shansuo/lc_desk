@@ -1,6 +1,6 @@
 [package]
 name = "lc_deck"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.80"
 description = "LC-Deck —— 局域网远控工具（类 ToDesk，仅限本地局域网）"
@@ -22,6 +22,7 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 socket2 = { version = "0.6", features = ["all"] }
+fast_image_resize = "6.1"
 
 [profile.release]
 opt-level = 3

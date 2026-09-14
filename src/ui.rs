@@ -384,6 +384,7 @@ impl App {
             let r_fps = ui.add(egui::Slider::new(&mut fps, 5..=30).suffix(" fps"));
             ui.label("画质：");
             let r_q = ui.add(egui::Slider::new(&mut jpeg_quality, 30..=95));
+            ui.colored_label(egui::Color32::from_gray(110), "即时生效");
             if r_fps.changed() {
                 self.shared.config.lock().unwrap().fps = fps;
             }
