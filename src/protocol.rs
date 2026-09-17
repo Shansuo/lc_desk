@@ -8,8 +8,9 @@ pub const TCP_DEFAULT_PORT: u16 = 48500;
 pub const UDP_DISCOVERY_PORT: u16 = 48501;
 /// 协议版本：写入 Hello 握手，不兼容时由对端拒绝连接。
 pub const PROTOCOL_VERSION: u32 = 1;
-/// 单条消息上限（4K JPEG 帧约 1~2MB，留足余量）
-const MAX_MSG_LEN: u32 = 64 * 1024 * 1024;
+/// 单条消息上限。4K JPEG 帧实测约 1~2MB，16MB 已有 8 倍余量；
+/// 上限同时是「未读内容就分配内存」的上界，过大会被异常/恶意对端打爆内存。
+pub const MAX_MSG_LEN: u32 = 16 * 1024 * 1024;
 
 const T_HELLO: u8 = 1;
 const T_AUTH: u8 = 2;

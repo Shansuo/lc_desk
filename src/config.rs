@@ -7,6 +7,10 @@ use std::path::PathBuf;
 pub const DEFAULT_FPS: u32 = 24;
 pub const DEFAULT_QUALITY: u8 = 70;
 pub const DEFAULT_MAX_WIDTH: u32 = 1920;
+/// 帧率下限/上限（与设置面板滑条保持一致，避免多处硬编码漂移）
+pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=30;
+pub const QUALITY_RANGE: std::ops::RangeInclusive<u8> = 30..=95;
+pub const MAX_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1280..=3840;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -66,7 +70,22 @@ impl Config {
             cfg.device_id = crate::platform::device_id();
             cfg.save();
         }
+        cfg.sanitize();
         cfg
+    }
+
+    /// 把越界的手改配置夹回合法区间（配置文件是明文可编辑的）。
+    pub fn sanitize(&mut self) {
+        self.fps = self.fps.clamp(*FPS_RANGE.start(), *FPS_RANGE.end());
+        self.jpeg_quality = self
+            .jpeg_quality
+            .clamp(*QUALITY_RANGE.start(), *QUALITY_RANGE.end());
+        self.max_width = self
+            .max_width
+            .clamp(*MAX_WIDTH_RANGE.start(), *MAX_WIDTH_RANGE.end());
+        if self.device_name.trim().is_empty() {
+            self.device_name = crate::platform::device_name();
+        }
     }
 
     pub fn save(&self) {
@@ -132,5 +151,19 @@ mod tests {
         assert!(!cfg.verify_password("hello124"));
         cfg.set_password("");
         assert!(!cfg.has_password());
+    }
+
+    #[test]
+    fn test_sanitize_clamps_out_of_range() {
+        let mut cfg = Config::default();
+        cfg.fps = 0;
+        cfg.jpeg_quality = 200;
+        cfg.max_width = 999999;
+        cfg.device_name = "   ".into();
+        cfg.sanitize();
+        assert_eq!(cfg.fps, *FPS_RANGE.start());
+        assert_eq!(cfg.jpeg_quality, *QUALITY_RANGE.end());
+        assert_eq!(cfg.max_width, *MAX_WIDTH_RANGE.end());
+        assert!(!cfg.device_name.trim().is_empty());
     }
 }

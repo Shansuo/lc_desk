@@ -1,6 +1,6 @@
 [package]
 name = "lc_deck"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.80"
 description = "LC-Deck —— 局域网远控工具（类 ToDesk，仅限本地局域网）"

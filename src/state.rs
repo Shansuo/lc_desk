@@ -19,10 +19,13 @@ pub struct AppShared {
     pub peers: PeerBook,
     pub events_tx: Sender<UiEvent>,
     pub ctx: egui::Context,
-    /// 允许被控制（总开关）
-    pub accepting: AtomicBool,
+    /// 允许被控制（总开关）。用 Arc 持有，便于直接交给发现线程共享，
+    /// 否则广播里的 accepting 永远是构造时的初始值。
+    pub accepting: Arc<AtomicBool>,
     /// 正在被控的会话数
     pub controlled_count: AtomicU64,
+    /// 上次密码校验失败的时刻（epoch 毫秒），用于暴力破解冷却
+    pub last_auth_fail_ms: AtomicU64,
     next_req_id: AtomicU64,
 }
 
@@ -34,15 +37,15 @@ impl AppShared {
         ctx: egui::Context,
     ) -> Self {
         let device_id = config.lock().unwrap().device_id.clone();
-        let accepting = AtomicBool::new(true);
         Self {
             device_id,
             config,
             peers,
             events_tx,
             ctx,
-            accepting,
+            accepting: Arc::new(AtomicBool::new(true)),
             controlled_count: AtomicU64::new(0),
+            last_auth_fail_ms: AtomicU64::new(0),
             next_req_id: AtomicU64::new(1),
         }
     }
@@ -57,6 +60,28 @@ impl AppShared {
 
     pub fn device_name(&self) -> String {
         self.config.lock().unwrap().device_name.clone()
+    }
+
+    /// 密码校验失败后的冷却：连续尝试之间至少间隔 `cooldown`，
+    /// 避免局域网内对控制密码做高速暴力枚举。
+    pub fn note_auth_failure(&self, cooldown_ms: u64) {
+        let now = crate::platform::now_millis();
+        let until = now + cooldown_ms;
+        // 只在推进时间时才写入，避免并发下的回退
+        self.last_auth_fail_ms
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.max(until))
+            })
+            .ok();
+    }
+
+    /// 按上次失败时间执行退避等待。
+    pub fn await_auth_cooldown(&self) {
+        let until = self.last_auth_fail_ms.load(Ordering::Relaxed);
+        let now = crate::platform::now_millis();
+        if until > now {
+            std::thread::sleep(std::time::Duration::from_millis(until - now));
+        }
     }
 }
 
@@ -78,7 +103,8 @@ pub enum UiEvent {
     },
     /// 主控端：会话已建立，打开远控窗口
     SessionStarted { session: Arc<crate::client::RemoteSession> },
-    SessionEnded { session_id: u64, reason: String },
+    /// 被控端：一个远控会话结束了
+    SessionEnded { peer_name: String, reason: String },
     Notice { text: String },
 }
 

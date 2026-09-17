@@ -2,62 +2,102 @@
 
 use crate::client::{OutMsg, RemoteSession};
 use crate::keys;
+use crate::theme;
 use egui::{
     Align2, Color32, Event, FontId, Key, Modifiers, PointerButton, Pos2, Rect, Sense, TextureOptions,
     Vec2, ViewportCommand,
 };
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
 pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
     // ---- 工具栏 ----
-    egui::Panel::top("remote_toolbar").show(ui, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("断开").clicked() {
-                session.disconnect("用户断开");
-            }
-            ui.separator();
-            let fs = session.fullscreen.load(std::sync::atomic::Ordering::Relaxed);
-            if ui.button(if fs { "退出全屏" } else { "全屏" }).clicked() {
-                let new_fs = !fs;
-                session.fullscreen.store(new_fs, std::sync::atomic::Ordering::Relaxed);
-                ui.ctx().send_viewport_cmd(ViewportCommand::Fullscreen(new_fs));
-            }
-            ui.separator();
-            let mut vo = session.view_only.load(std::sync::atomic::Ordering::Relaxed);
-            if ui.checkbox(&mut vo, "仅观看").changed() {
-                session.view_only.store(vo, std::sync::atomic::Ordering::Relaxed);
-            }
-            if ui.button("发送剪贴板").clicked() {
-                if !session.send_clipboard() {
-                    set_toast(session, "本地剪贴板没有文本内容");
-                } else {
-                    set_toast(session, "已发送本地剪贴板");
+    egui::Panel::top("remote_toolbar")
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .inner_margin(egui::Margin::symmetric(10, 7))
+                .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+        )
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.add(theme::danger_button("断开")).clicked() {
+                    session.disconnect("用户断开");
                 }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let stats = session.stats.lock().unwrap().clone();
-                ui.colored_label(
-                    Color32::from_gray(150),
-                    format!(
-                        "{:.0} fps · {:.0} ms · {}x{}",
-                        stats.fps, stats.rtt_ms, stats.frame_w, stats.frame_h
-                    ),
-                );
-                ui.label(&session.peer_name);
+
+                ui.add(egui::Separator::default().vertical());
+
+                let fs = session.fullscreen.load(Ordering::Relaxed);
+                if ui
+                    .add(theme::tool_button(if fs { "退出全屏" } else { "全屏" }, true))
+                    .clicked()
+                {
+                    let new_fs = !fs;
+                    session.fullscreen.store(new_fs, Ordering::Relaxed);
+                    ui.ctx().send_viewport_cmd(ViewportCommand::Fullscreen(new_fs));
+                }
+
+                let mut vo = session.view_only.load(Ordering::Relaxed);
+                let vo_resp = ui.add(theme::tool_button(
+                    if vo { "仅观看 ✓" } else { "仅观看" },
+                    true,
+                ));
+                if vo_resp.clicked() {
+                    vo = !vo;
+                    session.view_only.store(vo, Ordering::Relaxed);
+                    set_toast(
+                        session,
+                        if vo { "已切换到仅观看" } else { "已开启键鼠控制" },
+                    );
+                }
+
+                ui.add(egui::Separator::default().vertical());
+
+                if ui.add(theme::tool_button("发送剪贴板", true)).clicked() {
+                    if session.send_clipboard() {
+                        set_toast(session, "已发送本地剪贴板");
+                    } else {
+                        set_toast(session, "本地剪贴板没有文本内容");
+                    }
+                }
+
+                // 右侧状态区
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let stats = session.stats.lock().unwrap().clone();
+                    ui.add_space(4.0);
+                    stat_chip(
+                        ui,
+                        &format!("{:.0} fps", stats.fps),
+                        fps_color(stats.fps),
+                    );
+                    stat_chip(ui, &format!("{:.0} ms", stats.rtt_ms), rtt_color(stats.rtt_ms));
+                    if stats.frame_w > 0 {
+                        stat_chip(
+                            ui,
+                            &format!("{}×{}", stats.frame_w, stats.frame_h),
+                            theme::TEXT_DIM,
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(&session.peer_name)
+                            .size(13.5)
+                            .color(theme::TEXT)
+                            .strong(),
+                    );
+                    theme::dot_glow(ui, theme::ACCENT, 4.0);
+                });
             });
         });
-    });
 
     // ---- 画面区域 ----
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.fill(Color32::BLACK))
+        .frame(egui::Frame::NONE.fill(Color32::from_rgb(8, 9, 12)))
         .show(ui, |ui| {
             let frame = session.frame.lock().unwrap().clone();
             let Some(img) = frame else {
-                ui.centered_and_justified(|ui| {
-                    ui.colored_label(Color32::from_gray(140), "正在等待远端画面…");
-                });
+                theme::spinner_text(ui, "正在连接远端画面…");
                 return;
             };
 
@@ -68,22 +108,29 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
             let rect = Rect::from_center_size(avail.center(), size);
 
             // 纹理更新
-            let (tex_id, tex_size) = {
+            {
                 let mut st = session.ui_state.lock().unwrap();
                 let tex = st.texture.get_or_insert_with(|| {
                     ui.ctx().load_texture("remote", (*img).clone(), TextureOptions::LINEAR)
                 });
-                if session.frame_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                if session.frame_dirty.swap(false, Ordering::Relaxed) {
                     tex.set((*img).clone(), TextureOptions::LINEAR);
                 }
-                (tex.id(), tex.size_vec2())
-            };
+                let tex_id = tex.id();
+                ui.painter().image(
+                    tex_id,
+                    rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
 
-            ui.painter().image(
-                tex_id,
+            // 画面外框，避免黑背景下边界不清晰
+            ui.painter().rect_stroke(
                 rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
+                0.0,
+                egui::Stroke::new(1.0, theme::BORDER_STRONG),
+                egui::StrokeKind::Outside,
             );
 
             let response = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -92,28 +139,85 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
             }
 
-            handle_input(ui, session, rect, tex_size);
+            handle_input(ui, session, rect);
         });
+
+    // ---- 仅观看角标 ----
+    if session.view_only.load(Ordering::Relaxed) && !session.closed.load(Ordering::Relaxed) {
+        let painter = ui.painter();
+        let pos = Pos2::new(ui.clip_rect().right() - 74.0, ui.clip_rect().top() + 50.0);
+        painter.rect_filled(
+            Rect::from_center_size(pos, Vec2::new(132.0, 26.0)),
+            theme::R_PILL,
+            Color32::from_rgba_premultiplied(20, 23, 29, 235),
+        );
+        painter.text(
+            pos,
+            Align2::CENTER_CENTER,
+            "仅观看 · 不转发键鼠",
+            FontId::proportional(12.0),
+            theme::ACCENT,
+        );
+    }
 
     // ---- 提示浮层 ----
     let toast = session.ui_state.lock().unwrap().toast.clone();
     if let Some((at, text)) = toast {
         if at.elapsed() < std::time::Duration::from_secs(3) {
             let painter = ui.painter();
-            let pos = Pos2::new(ui.clip_rect().center().x, ui.clip_rect().bottom() - 36.0);
+            let pos = Pos2::new(ui.clip_rect().center().x, ui.clip_rect().bottom() - 40.0);
             painter.rect_filled(
-                Rect::from_center_size(pos, Vec2::new(260.0, 30.0)),
-                6.0,
-                Color32::from_rgba_unmultiplied(30, 30, 30, 220),
+                Rect::from_center_size(pos, Vec2::new(280.0, 32.0)),
+                theme::R_MD,
+                Color32::from_rgba_premultiplied(27, 31, 39, 240),
             );
             painter.text(
                 pos,
                 Align2::CENTER_CENTER,
                 text,
                 FontId::proportional(13.0),
-                Color32::WHITE,
+                theme::TEXT,
             );
         }
+    }
+}
+
+/// 状态药丸（fps / RTT / 分辨率共用）。
+fn stat_chip(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(11.5), color);
+    let size = galley.size() + Vec2::new(14.0, 7.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        theme::R_PILL,
+        Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 30),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.min.x + 7.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+}
+
+fn fps_color(fps: f32) -> Color32 {
+    if fps >= 20.0 {
+        theme::SUCCESS
+    } else if fps >= 10.0 {
+        theme::WARN
+    } else {
+        theme::DANGER
+    }
+}
+
+fn rtt_color(ms: f32) -> Color32 {
+    if ms <= 30.0 {
+        theme::SUCCESS
+    } else if ms <= 100.0 {
+        theme::WARN
+    } else {
+        theme::DANGER
     }
 }
 
@@ -121,9 +225,9 @@ fn set_toast(session: &RemoteSession, text: &str) {
     session.ui_state.lock().unwrap().toast = Some((Instant::now(), text.to_string()));
 }
 
-fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _tex_size: Vec2) {
-    let view_only = session.view_only.load(std::sync::atomic::Ordering::Relaxed);
-    let closed = session.closed.load(std::sync::atomic::Ordering::Relaxed);
+fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect) {
+    let view_only = session.view_only.load(Ordering::Relaxed);
+    let closed = session.closed.load(Ordering::Relaxed);
     if view_only || closed {
         return;
     }
@@ -203,7 +307,8 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _te
                     (dx, dy)
                 };
                 if dx != 0 || dy != 0 {
-                    let _ = session.input_tx.send(OutMsg::Wheel(crate::protocol::WheelMsg { dx, dy }));
+                    let _ =
+                        session.input_tx.send(OutMsg::Wheel(crate::protocol::WheelMsg { dx, dy }));
                 }
             }
             Event::Text(t) => {
@@ -293,7 +398,7 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect, _te
     // 声明 IME 激活（锚定在画面区）。eframe 依据 output.ime 是否为 Some
     // 来调用窗口 set_ime_allowed：不声明则系统在「无文本框」的窗口里
     // 直接屏蔽输入法切换（Ctrl+空格/Win+空格失效），无法输入中文。
-    ui.output_mut(|o| {
+    ui.ctx().output_mut(|o| {
         o.ime = Some(egui::output::IMEOutput {
             purpose: egui::IMEPurpose::Normal,
             rect,

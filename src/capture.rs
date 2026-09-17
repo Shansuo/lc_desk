@@ -27,7 +27,11 @@ pub fn read_cfg(live: &LiveCfg) -> CaptureConfig {
             jpeg_quality: c.jpeg_quality,
             max_width: c.max_width,
         })
-        .unwrap_or(CaptureConfig { fps: 15, jpeg_quality: 70, max_width: 1920 })
+        .unwrap_or(CaptureConfig {
+            fps: crate::config::DEFAULT_FPS,
+            jpeg_quality: crate::config::DEFAULT_QUALITY,
+            max_width: crate::config::DEFAULT_MAX_WIDTH,
+        })
 }
 
 /// 待编码的原始帧

@@ -12,6 +12,7 @@ mod platform;
 mod protocol;
 mod server;
 mod state;
+mod theme;
 mod ui;
 mod ui_remote;
 
@@ -26,8 +27,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("LC-Deck · 局域网远控")
-            .with_inner_size([470.0, 720.0])
-            .with_min_inner_size([400.0, 560.0]),
+            .with_inner_size([520.0, 780.0])
+            .with_min_inner_size([420.0, 600.0]),
         ..Default::default()
     };
 

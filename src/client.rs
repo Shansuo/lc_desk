@@ -224,7 +224,9 @@ fn try_connect(
                             session.stats.lock().unwrap().rtt_ms = rtt;
                         }
                         Ok(Msg::Clipboard(c)) => {
-                            crate::clipboard_sync::set_text(&c.text);
+                            // 走 apply_incoming 做去重：内容一致时不回写本地剪贴板，
+                            // 否则「本地→远端→本地」的回环会反复刷新剪贴板时间戳。
+                            crate::clipboard_sync::apply_incoming(&c.text);
                         }
                         Ok(Msg::Bye(b)) => {
                             session.disconnect(&b.reason);
@@ -328,8 +330,5 @@ fn decode_jpeg(jpeg: &[u8], w: u32, h: u32) -> Option<ColorImage> {
 }
 
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::platform::now_millis()
 }

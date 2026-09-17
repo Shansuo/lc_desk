@@ -41,6 +41,9 @@ pub fn new_peer_book() -> PeerBook {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// 广播专用发送套接字：绑到随机端口后 connect 到广播地址。
+/// 接收走另一个套接字（见 `open_listen_socket`），两者分离以免
+/// 发送端的 connect 过滤掉非广播来源的报文。
 fn open_socket() -> std::io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -49,7 +52,6 @@ fn open_socket() -> std::io::Result<UdpSocket> {
     socket.set_broadcast(true)?;
     let bind_addr: SocketAddr = "0.0.0.0:0".parse().expect("valid bind addr");
     socket.bind(&bind_addr.into())?;
-    // 收发共用：绑定到发现端口才能收到别人广播
     Ok(socket.into())
 }
 

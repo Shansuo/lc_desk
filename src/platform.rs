@@ -14,23 +14,47 @@ pub fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// 计算机显示名称（局域网内展示用）。
-pub fn device_name() -> String {
-    if let Ok(name) = hostname_via_cmd() {
-        if !name.trim().is_empty() {
-            return name.trim().to_string();
-        }
-    }
-    "未知设备".to_string()
+/// 当前 epoch 毫秒（心跳、冷却、RTT 共用同一时基）。
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
-fn hostname_via_cmd() -> std::io::Result<String> {
-    let out = if cfg!(target_os = "windows") {
-        std::process::Command::new("hostname").output()?
-    } else {
-        std::process::Command::new("hostname").output()?
-    };
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+/// 计算机显示名称（局域网内展示用）。
+pub fn device_name() -> String {
+    let mut candidates: Vec<String> = Vec::new();
+
+    // macOS：主机名形如 "Qixunde-MacBook-Pro.local"，计算机名更友好
+    #[cfg(target_os = "macos")]
+    candidates.push(cmd_output("/usr/sbin/scutil", &["--get", "ComputerName"]));
+
+    candidates.push(cmd_output("hostname", &[]));
+
+    candidates
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "未知设备".to_string())
+}
+
+/// 执行一条命令并返回 stdout（失败时返回空串）。
+fn cmd_output(program: &str, args: &[&str]) -> String {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// 本机在局域网中的出口 IP。手动连接时需要把它告诉对端，
+/// 这里用「connect 到外部地址再读 local_addr」的方式让内核挑出
+/// 实际出网网卡（不会真正发包），比遍历网卡可靠。
+pub fn local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 /// 稳定设备 ID：优先取系统硬件 UUID，否则用随机并持久化（由 config 兜底）。

@@ -4,12 +4,16 @@ use crate::capture::{self};
 use crate::input_exec::InputExecutor;
 use crate::protocol::{self, Msg};
 use crate::state::{tune_stream, AppShared, ControlledSession, UiEvent};
-use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// 密码校验失败后的冷却时长（毫秒）。局域网内无 TLS，靠退避防止高速枚举。
+const AUTH_COOLDOWN_MS: u64 = 1_500;
+/// 会话中读取对端消息的超时（仅用于让循环有机会检查停止标志）
+const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 启动被控端监听线程。
 pub fn start_server(shared: Arc<AppShared>) -> std::thread::JoinHandle<()> {
@@ -35,10 +39,13 @@ fn run_listener(shared: Arc<AppShared>) {
         match stream {
             Ok(stream) => {
                 let shared = shared.clone();
-                std::thread::Builder::new()
+                if std::thread::Builder::new()
                     .name("lc-conn".into())
                     .spawn(move || handle_conn(shared, stream))
-                    .ok();
+                    .is_err()
+                {
+                    log::warn!("无法为新的主控端连接创建线程");
+                }
             }
             Err(e) => {
                 log::warn!("接受连接失败: {e}");
@@ -84,8 +91,15 @@ fn handle_conn(shared: Arc<AppShared>, stream: TcpStream) {
     // ---- 密码鉴权 ----
     let mut password_ok = !auth_required;
     if auth_required {
-        match protocol::read_msg(&mut reader) {            Ok(Msg::Auth(a)) => {
+        // 先按上次失败时间退避，再校验：连续失败之间强制间隔
+        shared.await_auth_cooldown();
+        match protocol::read_msg(&mut reader) {
+            Ok(Msg::Auth(a)) => {
                 password_ok = shared.config.lock().unwrap().verify_password(&a.password);
+                if !password_ok {
+                    shared.note_auth_failure(AUTH_COOLDOWN_MS);
+                    log::warn!("来自 {peer_ip} 的密码校验失败");
+                }
                 let _ = protocol::write_msg(
                     &mut stream,
                     &Msg::AuthResult(protocol::AuthResult {
@@ -117,10 +131,11 @@ fn handle_conn(shared: Arc<AppShared>, stream: TcpStream) {
 
     // ---- 建立会话 ----
     let session_id = shared.next_req_id();
+    let peer_name = hello.name.clone();
     match run_session(&shared, stream, reader, view_only, &hello, &peer_ip, session_id) {
         Ok(reason) => {
             log::info!("会话 {session_id} 结束: {reason}");
-            let _ = shared.events_tx.send(UiEvent::SessionEnded { session_id, reason });
+            let _ = shared.events_tx.send(UiEvent::SessionEnded { peer_name, reason });
         }
         Err(e) => {
             log::warn!("会话 {session_id} 建立失败: {e}");
@@ -190,15 +205,39 @@ fn decide_accept(
         stream,
         &Msg::ControlResult(protocol::ControlResult {
             ok: accepted,
-            message: if accepted { "ok".into() } else { "对端拒绝了本次连接".into() },
+            message: if accepted {
+                "ok".into()
+            } else {
+                "对端拒绝了本次连接".into()
+            },
         }),
     );
     accepted
 }
 
 /// 会话主体：抓屏发送 + 输入执行 + 剪贴板同步。
+///
+/// 计数与清理放在外层，保证任何提前返回的路径都不会漏掉
+/// `controlled_count` 的递减（否则主界面会永久显示「正在被 N 台设备控制」）。
 fn run_session(
     shared: &Arc<AppShared>,
+    stream: TcpStream,
+    reader: TcpStream,
+    view_only: bool,
+    hello: &protocol::Hello,
+    peer_ip: &str,
+    session_id: u64,
+) -> Result<String, String> {
+    let executor = InputExecutor::new(shared.config.lock().unwrap().ctrl_as_cmd).map_err(|e| e)?;
+    shared.controlled_count.fetch_add(1, Ordering::Relaxed);
+    let result = session_loop(shared, executor, stream, reader, view_only, hello, peer_ip, session_id);
+    shared.controlled_count.fetch_sub(1, Ordering::Relaxed);
+    result
+}
+
+fn session_loop(
+    shared: &Arc<AppShared>,
+    mut executor: InputExecutor,
     stream: TcpStream,
     mut reader: TcpStream,
     view_only: bool,
@@ -206,12 +245,13 @@ fn run_session(
     peer_ip: &str,
     session_id: u64,
 ) -> Result<String, String> {
-    let mut executor = InputExecutor::new(shared.config.lock().unwrap().ctrl_as_cmd)
-        .map_err(|e| e)?;
-    log::info!("会话 {session_id} 开始：{}({}) view_only={view_only}", hello.name, peer_ip);
+    log::info!(
+        "会话 {session_id} 开始：{}({}) view_only={view_only}",
+        hello.name,
+        peer_ip
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
-    shared.controlled_count.fetch_add(1, Ordering::Relaxed);
 
     // 控制消息通道：reader 线程 → writer 线程（Pong / Clipboard / Bye）
     let (ctl_tx, ctl_rx) = mpsc::channel::<Msg>();
@@ -222,12 +262,12 @@ fn run_session(
     // 帧通道（有界，最新帧优先：容量 1，编码完成即替换，避免排队积压延迟）
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(1);
     // 传配置句柄而非快照：用户在设置里调整帧率/画质/宽度可实时生效
-    let cap_stop = stop.clone();
+    let capture_stop = stop.clone();
     let notify = shared.clone();
     let capture_handle = capture::spawn_capture(
         shared.config.clone(),
         frame_tx,
-        cap_stop,
+        capture_stop,
         Box::new(move |text| notify.notify(text)),
     );
 
@@ -236,6 +276,7 @@ fn run_session(
         Ok(w) => w,
         Err(e) => {
             stop.store(true, Ordering::Relaxed);
+            let _ = capture_handle.join();
             return Err(format!("clone stream failed: {e}"));
         }
     };
@@ -274,7 +315,9 @@ fn run_session(
                     break;
                 }
             }
-            let _ = writer.flush();
+            // 关键：无论是发送失败还是通道关闭退出，都必须点亮停止标志，
+            // 否则抓屏线程与外层的 capture_handle.join() 会永久等待。
+            writer_stop.store(true, Ordering::Relaxed);
         })
         .expect("spawn lc-conn-writer");
 
@@ -290,9 +333,10 @@ fn run_session(
     // reader 主循环：输入执行 + 控制应答
     let mut reason = "对端已断开".to_string();
     let mut input_err: Option<String> = None;
-    let _ = reader.set_read_timeout(Some(Duration::from_secs(30)));    loop {
+    let _ = reader.set_read_timeout(Some(SESSION_READ_TIMEOUT));
+    loop {
         if stop.load(Ordering::Relaxed) {
-            reason = "对端已断开".to_string();
+            reason = "连接已断开".to_string();
             break;
         }
         match protocol::read_msg(&mut reader) {
@@ -343,7 +387,8 @@ fn run_session(
                 reason = "连接已断开".to_string();
                 break;
             }
-        }    }
+        }
+    }
 
     stop.store(true, Ordering::Relaxed);
     let _ = ctl_tx.send(Msg::Bye(protocol::ByeMsg { reason: "会话结束".into() }));
@@ -351,12 +396,11 @@ fn run_session(
     let _ = writer_handle.join();
     let _ = clip_handle.join();
     executor.release_all();
-    shared.controlled_count.fetch_sub(1, Ordering::Relaxed);
 
-    if let Some(e) = input_err {
-        return Err(e);
+    match input_err {
+        Some(e) => Err(e),
+        None => Ok(reason),
     }
-    Ok(reason)
 }
 
 /// 双向剪贴板同步（被控端）：本地变更 → 推送；远端文本 → 应用。
