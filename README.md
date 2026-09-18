@@ -32,14 +32,26 @@ cargo build --release
 #### 首次打开被 Gatekeeper 拦截
 
 本项目**没有 Apple Developer ID 签名**，macOS 会对从浏览器下载的文件打上隔离标记，
-首次双击会弹「无法验证『lc_deck』是否包含恶意软件」。这不是软件有问题，
-在终端执行下面一条命令移除隔离标记即可（对目录递归，文件内容不受影响）：
+首次双击会弹「无法验证『lc_deck』是否包含恶意软件」。这不是软件有问题。
+
+**推荐：用安装脚本**（产物内已附带），它会清除隔离标记并把程序包装成 `LC-Deck.app`
+装到 `/Applications`，双击即用：
+
+```bash
+cd ~/Downloads/lc_deck-v*-apple-darwin
+./install-macos.sh
+```
+
+包装成 `.app` 还有一个好处：屏幕录制 / 辅助功能权限是按 bundle id 记录的，
+脚本使用固定的 `top.swwarn.lcdeck`，**升级版本不用重新授权**。
+
+不想跑脚本的话，直接移除隔离标记也可以（对目录递归，文件内容不受影响）：
 
 ```bash
 xattr -dr com.apple.quarantine ~/Downloads/lc_deck-v*-apple-darwin
 ```
 
-之后即可正常双击打开。另外两个等效办法：
+另外两个等效办法：
 
 - Finder 中 **右键 → 打开**，弹窗里会多出一个「打开」按钮
 - 若已经点过「好」，到 **系统设置 → 隐私与安全性** 底部点「仍要打开」

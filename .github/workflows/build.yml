@@ -47,6 +47,9 @@ jobs:
           mkdir -p "dist/${NAME}"
           cp "target/${{ matrix.target }}/release/lc_deck" "dist/${NAME}/"
           cp README.md "dist/${NAME}/" || true
+          # macOS 安装脚本：清隔离标记 + 包装成 .app（Linux 产物带上也无害）
+          cp scripts/install-macos.sh "dist/${NAME}/" || true
+          chmod +x "dist/${NAME}/install-macos.sh" || true
           cd dist && tar czf "${NAME}.tar.gz" "${NAME}" && cd ..
 
       - name: Package (Windows)
