@@ -65,7 +65,20 @@ cargo build --release
 或直接下载 [GitHub Releases](../../releases) 中的 `lc_deck-v*-x86_64-pc-windows-msvc.zip`。
 
 > Windows Defender 首次运行可能拦截未签名程序，选择「仍要运行」即可。
-> 若提示防火墙，请对专用（家庭/工作）网络放行。
+
+#### 防火墙放行（Windows 上最常见的问题）
+
+Windows 防火墙默认**阻止入站**，不放行的话这台机器既不会被发现、也无法被连接
+（表现为：别的设备列表里没有它，或点「控制」一直转圈后失败）。
+
+首次运行通常会弹窗，对**专用网络**放行即可。若没弹窗或已点过拒绝，管理员 PowerShell 执行：
+
+```powershell
+netsh advfirewall firewall add rule name="LC-Deck TCP" dir=in action=allow protocol=TCP localport=48500 profile=private
+netsh advfirewall firewall add rule name="LC-Deck UDP" dir=in action=allow protocol=UDP localport=48501 profile=private
+```
+
+端口改过的话把上面的 `48500` / `48501` 换成实际值。
 
 ### 互相控制
 
@@ -75,6 +88,19 @@ cargo build --release
 4. 对端弹窗确认后，自动打开远控窗口
 
 远控窗口支持：全屏切换、仅观看切换、发送本地剪贴板、状态栏显示 fps / RTT / 分辨率。
+
+### 设备发现不到？按顺序排查
+
+1. **对端确实在运行** —— 且没被最小化到后台服务
+2. **同一网段** —— 若一台连了 VPN 或虚拟机网卡，广播可能发到别的网络。
+   本机会向**所有网卡的子网广播地址**通告（不只是 `255.255.255.255`），
+   但仍需两边在同一广播域
+3. **Windows 防火墙** —— 见上文，需要放行入站 TCP/UDP
+4. **macOS 防火墙** —— 系统设置 → 网络 → 防火墙，若开启需允许 `lc_deck` 接收传入连接
+5. **兜底：手动连接** —— 在主窗口底部输入对端 IP（对端的 IP 显示在它的「本机 IP」一栏），
+   不依赖广播。能连上就说明只是发现问题，不是网络不通
+
+启动日志会打印实际广播目标（`RUST_LOG=info ./lc_deck`），可用于确认网卡枚举是否正确。
 
 ## 连接方式
 

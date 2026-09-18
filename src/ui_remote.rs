@@ -149,7 +149,7 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
         painter.rect_filled(
             Rect::from_center_size(pos, Vec2::new(132.0, 26.0)),
             theme::R_PILL,
-            Color32::from_rgba_premultiplied(20, 23, 29, 235),
+            Color32::from_rgba_unmultiplied(20, 23, 29, 235),
         );
         painter.text(
             pos,
@@ -169,7 +169,7 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
             painter.rect_filled(
                 Rect::from_center_size(pos, Vec2::new(280.0, 32.0)),
                 theme::R_MD,
-                Color32::from_rgba_premultiplied(27, 31, 39, 240),
+                Color32::from_rgba_unmultiplied(27, 31, 39, 240),
             );
             painter.text(
                 pos,
@@ -189,11 +189,8 @@ fn stat_chip(ui: &mut egui::Ui, text: &str, color: Color32) {
         .layout_no_wrap(text.to_string(), FontId::proportional(11.5), color);
     let size = galley.size() + Vec2::new(14.0, 7.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect_filled(
-        rect,
-        theme::R_PILL,
-        Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 30),
-    );
+    ui.painter()
+        .rect_filled(rect, theme::R_PILL, theme::tint(color, 44));
     ui.painter().galley(
         egui::pos2(rect.min.x + 7.0, rect.center().y - galley.size().y / 2.0),
         galley,

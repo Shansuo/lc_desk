@@ -85,7 +85,7 @@ fn apply_to_style(style: &mut egui::Style) {
 
     v.widgets.open = v.widgets.hovered;
 
-    v.selection.bg_fill = Color32::from_rgba_premultiplied(45, 212, 191, 48);
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(45, 212, 191, 60);
     v.selection.stroke = Stroke::new(1.0, ACCENT);
 
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
@@ -125,9 +125,19 @@ pub fn sunken() -> Frame {
         .inner_margin(Margin::same(6))
 }
 
-/// 分组小标题。
+/// 分组小标题。用 TEXT_DIM 而非 TEXT_FAINT：12px 小字配最暗灰在
+/// 深色底上对比度不足，实测发虚。
 pub fn section_title(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(12.0).color(TEXT_FAINT).strong());
+    ui.label(RichText::new(text).size(12.0).color(TEXT_DIM).strong());
+}
+
+/// 生成半透明底色。
+///
+/// 必须用 `from_rgba_unmultiplied`：egui 的 Color32 内部存的是**已预乘 alpha**
+/// 的分量。若把未预乘的 r/g/b 传给 `from_rgba_premultiplied`，低 alpha 的背景
+/// 会被渲染成高亮饱和色块，同色文字直接糊在背景上看不清。
+pub fn tint(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
 /// 带柔和光晕的状态点（在线指示）。
@@ -136,11 +146,11 @@ pub fn dot_glow(ui: &mut Ui, color: Color32, radius: f32) {
         ui.allocate_exact_size(Vec2::splat(radius * 4.0), egui::Sense::hover());
     let c = rect.center();
     ui.painter()
-        .circle_filled(c, radius * 2.0, Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 45));
+        .circle_filled(c, radius * 2.0, tint(color, 45));
     ui.painter().circle_filled(c, radius, color);
 }
 
-/// 胶囊标签：灰底文字 + 可选彩色值。
+/// 胶囊标签：淡色底 + 同色文字（底色与文字都取自 `color`）。
 pub fn pill(ui: &mut Ui, text: impl Into<String>, color: Color32) {
     let text: String = text.into();
     let galley = ui.painter().layout_no_wrap(
@@ -153,7 +163,7 @@ pub fn pill(ui: &mut Ui, text: impl Into<String>, color: Color32) {
     ui.painter().rect_filled(
         rect,
         R_PILL,
-        Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 28),
+        tint(color, 42),
     );
     ui.painter().galley(
         egui::pos2(rect.min.x + 8.0, rect.center().y - galley.size().y / 2.0),
@@ -182,8 +192,8 @@ pub fn ghost_button(text: &str) -> egui::Button<'static> {
 /// 危险按钮。
 pub fn danger_button(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text).color(DANGER))
-        .fill(Color32::from_rgba_premultiplied(242, 84, 91, 26))
-        .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(242, 84, 91, 90)))
+        .fill(Color32::from_rgba_unmultiplied(242, 84, 91, 34))
+        .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(242, 84, 91, 150)))
         .corner_radius(R_SM)
         .min_size(Vec2::new(64.0, 28.0))
 }
@@ -210,11 +220,7 @@ pub fn toggle(ui: &mut Ui, id: egui::Id, on: &mut bool) -> egui::Response {
         *on = !*on;
     }
     let t = ui.ctx().animate_bool(id, *on);
-    let bg = if *on {
-        Color32::from_rgba_premultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), 210)
-    } else {
-        BORDER_STRONG
-    };
+    let bg = if *on { tint(ACCENT, 210) } else { BORDER_STRONG };
     ui.painter().rect_filled(rect, R_PILL, bg);
     let r = size.y / 2.0 - 3.0;
     let x = rect.left() + 3.0 + r + t * (rect.width() - 6.0 - r * 2.0);

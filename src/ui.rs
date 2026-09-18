@@ -95,21 +95,30 @@ impl App {
 
         // 发现线程。注意必须把 shared.accepting 交给它，
         // 否则广播里的 accepting 恒为 true，主界面开关形同虚设。
-        let discovery_stop = crate::discovery::start_discovery(
+        // 发现线程失败必须让用户看见：此前用 .ok() 静默丢弃，
+        // 一旦端口被占用或广播不可用，界面只会一直显示「找不到设备」而无从排查。
+        let mut init_error: Option<String> = None;
+        let discovery_stop = match crate::discovery::start_discovery(
             shared.device_id.clone(),
             shared.peers.clone(),
             shared.accepting.clone(),
             shared.config.clone(),
             ctx.clone(),
-        )
-        .ok();
+        ) {
+            Ok(stop) => Some(stop),
+            Err(e) => {
+                log::error!("设备发现启动失败: {e}");
+                init_error = Some(format!("设备发现启动失败，无法搜索局域网设备：{e}"));
+                None
+            }
+        };
         // 被控端服务
         crate::server::start_server(shared.clone());
 
         // 主界面保活重绘（设备列表刷新）
         ctx.request_repaint_after(Duration::from_secs(1));
 
-        Self {
+        let mut app = Self {
             shared,
             events_rx,
             sessions: Vec::new(),
@@ -124,7 +133,11 @@ impl App {
             pending_focus: VecDeque::new(),
             local_ip: None,
             last_ip_check: Instant::now(),
+        };
+        if let Some(err) = init_error {
+            app.push_toast(ToastKind::Error, err);
         }
+        app
     }
 
     fn drain_events(&mut self) {
@@ -237,7 +250,7 @@ impl App {
                         theme::pill(
                             ui,
                             if accepting { "可被控制" } else { "已关闭被控" },
-                            if accepting { theme::SUCCESS } else { theme::TEXT_FAINT },
+                            if accepting { theme::SUCCESS } else { theme::TEXT_DIM },
                         );
                     });
                 });
@@ -389,7 +402,7 @@ impl App {
                     ui,
                     "◎",
                     "正在搜索局域网设备…",
-                    "请确认对端已运行 LC-Deck 且处于同一局域网",
+                    "确认对端已运行且防火墙已放行；也可用上方「本机 IP」手动连接",
                 );
             });
             return;
@@ -449,7 +462,7 @@ impl App {
                 });
             } else {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::pill(ui, "已关闭被控", theme::TEXT_FAINT);
+                    theme::pill(ui, "已关闭被控", theme::TEXT_DIM);
                 });
             }
         });
@@ -956,11 +969,8 @@ impl App {
 /// 品牌标记：一个简单的显示器图形。
 fn draw_logo(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), egui::Sense::hover());
-    ui.painter().rect_filled(
-        rect,
-        theme::R_MD,
-        egui::Color32::from_rgba_premultiplied(45, 212, 191, 34),
-    );
+    ui.painter()
+        .rect_filled(rect, theme::R_MD, theme::tint(theme::ACCENT, 34));
     // 屏幕
     let screen = egui::Rect::from_min_size(
         rect.min + Vec2::new(8.0, 10.0),
