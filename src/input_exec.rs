@@ -13,6 +13,9 @@ pub struct InputExecutor {
     extent: (i32, i32),
     /// 被控端为 macOS 时，把 Ctrl 映射为 Command（Windows 主控的习惯）
     ctrl_as_cmd: bool,
+    /// 滚动换算的余数（单位：行）。Windows 的滚动粒度是整「档」，
+    /// 不足一档的部分必须留着，否则小幅滚动会被直接吞掉。
+    wheel_rem: (f32, f32), // (水平, 垂直)
 }
 
 impl InputExecutor {
@@ -31,7 +34,13 @@ impl InputExecutor {
             .main_display()
             .map_err(|e| format!("获取屏幕尺寸失败: {e}"))?;
         log::info!("输入执行器就绪，屏幕范围 {}x{}", extent.0, extent.1);
-        Ok(Self { enigo, pressed_mods: HashSet::new(), extent, ctrl_as_cmd })
+        Ok(Self {
+            enigo,
+            pressed_mods: HashSet::new(),
+            extent,
+            ctrl_as_cmd,
+            wheel_rem: (0.0, 0.0),
+        })
     }
 
     pub fn handle_mouse(&mut self, m: &MouseMsg) -> Result<(), String> {
@@ -56,12 +65,38 @@ impl InputExecutor {
         Ok(())
     }
 
+    /// 协议里 dx/dy 的单位统一是「行」（见 ui_remote 的滚轮归一化）。
     pub fn handle_wheel(&mut self, w: &WheelMsg) -> Result<(), String> {
-        if w.dy != 0 {
-            self.enigo.scroll(w.dy, Axis::Vertical).map_err(es)?;
+        self.scroll_lines(w.dy as f32, Axis::Vertical)?;
+        self.scroll_lines(w.dx as f32, Axis::Horizontal)?;
+        Ok(())
+    }
+
+    fn scroll_lines(&mut self, lines: f32, axis: Axis) -> Result<(), String> {
+        if lines == 0.0 {
+            return Ok(());
         }
-        if w.dx != 0 {
-            self.enigo.scroll(w.dx, Axis::Horizontal).map_err(es)?;
+        let vertical = matches!(axis, Axis::Vertical);
+        let rem = if vertical { &mut self.wheel_rem.1 } else { &mut self.wheel_rem.0 };
+
+        // enigo 各平台 scroll() 的单位并不一致：
+        //   · macOS   —— ScrollEventUnit::LINE，传入的就是「行」
+        //   · Windows —— mouse_event 的 WHEEL_DELTA 倍数，单位是「档(notch)」，
+        //                一档约 3 行，且最小粒度就是一档（滚不了半档）
+        // 所以 Windows 上必须把行换算成档，否则滚动量会被放大约 3 倍；
+        // 同时用余数保留不足一档的部分，避免轻扫一下完全没反应。
+        let amount: i32 = if cfg!(target_os = "windows") {
+            const LINES_PER_NOTCH: f32 = 3.0;
+            let total = (*rem + lines) / LINES_PER_NOTCH;
+            let notches = total.trunc();
+            *rem = (total - notches) * LINES_PER_NOTCH;
+            notches as i32
+        } else {
+            lines.round() as i32
+        };
+
+        if amount != 0 {
+            self.enigo.scroll(amount, axis).map_err(es)?;
         }
         Ok(())
     }

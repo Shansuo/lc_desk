@@ -9,7 +9,20 @@ use egui::{
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+// ---- 滚轮换算 ----
+// enigo 的 scroll() 以「行」为单位，这里把各种滚轮输入统一归一化到行。
+/// 一格滚轮（Line 单位下 delta = 1.0）对应的行数，贴近 mac/Windows 原生手感
+const LINES_PER_NOTCH: f32 = 3.0;
+/// 触控板/像素单位（Point）下每行的像素数
+const PX_PER_LINE: f32 = 16.0;
+/// 一页对应的行数
+const LINES_PER_PAGE: f32 = 10.0;
+/// 滚动停止多久后补发残留
+const WHEEL_FLUSH_IDLE: Duration = Duration::from_millis(220);
+/// 残留超过多少才值得补发一行
+const WHEEL_FLUSH_MIN: f32 = 0.2;
 
 pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
     // ---- 工具栏 ----
@@ -218,6 +231,46 @@ fn rtt_color(ms: f32) -> Color32 {
     }
 }
 
+/// 取出累积量里已满一行的整数部分。
+fn take_lines(acc: &mut f32) -> i32 {
+    if acc.abs() < 1.0 {
+        return 0;
+    }
+    let v = acc.trunc() as i32;
+    *acc -= v as f32;
+    v
+}
+
+/// 滚动停止后，把不足一行但确实存在的残留补发一行。
+///
+/// 触控板轻扫一下的 delta 往往凑不满一行，不补的话这一次滚动就凭空丢了，
+/// 表现为「轻扫没反应、用力扫才动」。
+fn flush_wheel(session: &RemoteSession) {
+    let mut st = session.ui_state.lock().unwrap();
+    let idle = match st.wheel_last {
+        Some(t) => t.elapsed() >= WHEEL_FLUSH_IDLE,
+        None => false,
+    };
+    if !idle {
+        return;
+    }
+    st.wheel_last = None;
+    let mut dx = 0;
+    let mut dy = 0;
+    if st.wheel_acc.0.abs() >= WHEEL_FLUSH_MIN {
+        dx = if st.wheel_acc.0 > 0.0 { 1 } else { -1 };
+        st.wheel_acc.0 = 0.0;
+    }
+    if st.wheel_acc.1.abs() >= WHEEL_FLUSH_MIN {
+        dy = if st.wheel_acc.1 > 0.0 { 1 } else { -1 };
+        st.wheel_acc.1 = 0.0;
+    }
+    if dx != 0 || dy != 0 {
+        drop(st);
+        let _ = session.input_tx.send(OutMsg::Wheel(crate::protocol::WheelMsg { dx, dy }));
+    }
+}
+
 fn set_toast(session: &RemoteSession, text: &str) {
     session.ui_state.lock().unwrap().toast = Some((Instant::now(), text.to_string()));
 }
@@ -277,31 +330,32 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect) {
                 }
                 send_mouse(session, nx, ny, idx.min(2) as u8, action);
             }
-            Event::MouseWheel { delta, .. } => {
+            Event::MouseWheel { delta, unit, .. } => {
                 let pos = ui.input(|i| i.pointer.latest_pos());
                 let inside = pos.map(|p| rect.contains(p)).unwrap_or(false);
                 if !inside {
                     continue;
                 }
+                // delta 的单位由 unit 决定，必须先归一化成「行」
+                //（enigo 的 scroll() 以行为单位）。此前一律除以 40，
+                // 而 macOS 鼠标滚轮上报的是 Line（一格 = 1.0），
+                // 结果要滚 40 格才发出一次 —— 表现就是滚轮完全没反应。
+                let to_lines = |v: f32| -> f32 {
+                    match unit {
+                        egui::MouseWheelUnit::Line => v * LINES_PER_NOTCH,
+                        egui::MouseWheelUnit::Point => v / PX_PER_LINE,
+                        egui::MouseWheelUnit::Page => v * LINES_PER_PAGE,
+                    }
+                };
                 let (dx, dy) = {
                     let mut st = session.ui_state.lock().unwrap();
-                    st.wheel_acc.0 -= delta.x / 40.0;
-                    st.wheel_acc.1 -= delta.y / 40.0; // egui 向上为正 → enigo 向下为正
-                    let dx = if st.wheel_acc.0.abs() >= 1.0 {
-                        let v = st.wheel_acc.0.trunc() as i32;
-                        st.wheel_acc.0 -= v as f32;
-                        v
-                    } else {
-                        0
-                    };
-                    let dy = if st.wheel_acc.1.abs() >= 1.0 {
-                        let v = st.wheel_acc.1.trunc() as i32;
-                        st.wheel_acc.1 -= v as f32;
-                        v
-                    } else {
-                        0
-                    };
-                    (dx, dy)
+                    st.wheel_acc.0 -= to_lines(delta.x);
+                    st.wheel_acc.1 -= to_lines(delta.y); // egui 向上为正 → enigo 向下为正
+                    st.wheel_last = Some(Instant::now());
+                    (
+                        take_lines(&mut st.wheel_acc.0),
+                        take_lines(&mut st.wheel_acc.1),
+                    )
                 };
                 if dx != 0 || dy != 0 {
                     let _ =
@@ -385,6 +439,9 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect) {
             _ => {}
         }
     }
+    // 每帧检查：滚动停下后补发不足一行的残留
+    flush_wheel(session);
+
     // 失焦兜底：本窗口失焦时不会收到修饰键抬起事件，主动释放，
     // 否则被控端会残留 Shift/Ctrl 卡键（大写卡死、组合键错乱）。
     let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
@@ -435,4 +492,39 @@ fn send_mouse(session: &Arc<RemoteSession>, x: f32, y: f32, button: u8, action: 
     let _ = session
         .input_tx
         .send(OutMsg::Mouse(crate::protocol::MouseMsg { x, y, button, action }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_one_wheel_notch_is_not_swallowed() {
+        // 回归：macOS 鼠标滚轮上报的是 Line 单位（一格 delta = 1.0）。
+        // 旧实现一律 delta / 40，要滚 40 格才发出一次 —— 表现就是滚轮完全没反应。
+        let mut acc = 0.0;
+        acc -= 1.0 * LINES_PER_NOTCH;
+        let v = take_lines(&mut acc);
+        assert_eq!(v.abs(), 3, "一格滚轮应立即产生约 3 行滚动");
+        assert!(acc.abs() < 0.001);
+    }
+
+    #[test]
+    fn test_take_lines_keeps_fraction() {
+        let mut acc = 0.0;
+        acc -= 0.4;
+        assert_eq!(take_lines(&mut acc), 0, "不足一行不应发送");
+        assert!((acc + 0.4).abs() < 0.001, "余数必须保留下来，不能丢弃");
+        acc -= 0.8;
+        assert_eq!(take_lines(&mut acc), -1);
+        assert!(acc.abs() < 0.3, "仍应保留 -0.2 的余数");
+    }
+
+    #[test]
+    fn test_trackpad_point_unit_converts_to_lines() {
+        // 触控板是 Point 单位（像素），按 PX_PER_LINE 折算成行
+        let mut acc = 0.0;
+        acc -= 32.0 / PX_PER_LINE;
+        assert_eq!(take_lines(&mut acc), -2);
+    }
 }

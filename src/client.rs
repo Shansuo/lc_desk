@@ -53,8 +53,10 @@ pub struct RemoteUiState {
     pub buttons_down: [bool; 3],
     /// 上次发送的修饰键状态
     pub last_mods: [bool; 4], // ctrl alt shift super
-    /// 滚轮小数累积
+    /// 滚轮小数累积（单位：行）
     pub wheel_acc: (f32, f32),
+    /// 最近一次滚轮事件的时间，用于停止滚动后补发不足一行的残留
+    pub wheel_last: Option<Instant>,
     /// 最近一条提示
     pub toast: Option<(Instant, String)>,
 }
