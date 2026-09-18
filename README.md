@@ -19,10 +19,32 @@
 
 ### macOS
 
+从源码构建：
+
 ```bash
 cargo build --release
 ./target/release/lc_deck
 ```
+
+从 [GitHub Releases](../../releases) 下载 `lc_deck-v*-aarch64-apple-darwin.tar.gz`（Apple 芯片）
+或 `x86_64-apple-darwin`（Intel），解压后即可。
+
+#### 首次打开被 Gatekeeper 拦截
+
+本项目**没有 Apple Developer ID 签名**，macOS 会对从浏览器下载的文件打上隔离标记，
+首次双击会弹「无法验证『lc_deck』是否包含恶意软件」。这不是软件有问题，
+在终端执行下面一条命令移除隔离标记即可（对目录递归，文件内容不受影响）：
+
+```bash
+xattr -dr com.apple.quarantine ~/Downloads/lc_deck-v*-apple-darwin
+```
+
+之后即可正常双击打开。另外两个等效办法：
+
+- Finder 中 **右键 → 打开**，弹窗里会多出一个「打开」按钮
+- 若已经点过「好」，到 **系统设置 → 隐私与安全性** 底部点「仍要打开」
+
+> 想从根上消除该提示，需要用 Developer ID 证书签名并公证（见下方「签名与公证」）。
 
 首次在 **被控端** 使用需要授予两项系统权限（应用内「🔑 macOS 权限说明」有直达按钮）：
 
@@ -96,8 +118,32 @@ src/
 
 ```bash
 ./scripts/package.sh          # 当前平台
-git tag v0.1.0 && git push --tags   # 触发 CI 三平台构建并发布 Release
+git tag v0.1.6 && git push --tags   # 触发 CI 三平台构建并发布 Release
 ```
+
+> CI 只在 **推送 `v*` 标签** 或手动 `workflow_dispatch` 时运行，仅推 `main` 不会触发。
+
+## 签名与公证（可选）
+
+默认发布产物是**未签名**的，因此 macOS 会弹 Gatekeeper 警告（见上文）。
+若你有 Apple Developer Program 会员资格，可配置 CI 自动签名 + 公证，产物即可直接双击打开。
+
+需要准备：
+
+1. 从开发者后台下载 **Developer ID Application** 证书，导出为 `.p12`
+2. 在 [appleid.apple.com](https://appleid.apple.com) 生成 **App 专用密码**
+3. 在仓库 Settings → Secrets 添加：
+
+| Secret | 内容 |
+|--------|------|
+| `MACOS_CERTIFICATE` | `.p12` 的 Base64（`base64 -i cert.p12`） |
+| `MACOS_CERTIFICATE_PASSWORD` | `.p12` 导出密码 |
+| `MACOS_SIGN_IDENTITY` | 形如 `Developer ID Application: 你的名字 (TEAMID)` |
+| `APPLE_ID` | Apple ID 邮箱 |
+| `APPLE_APP_PASSWORD` | App 专用密码 |
+| `APPLE_TEAM_ID` | 10 位 Team ID |
+
+未配置时 CI 会跳过签名步骤，构建行为与现在完全一致。
 
 ## 已知限制
 
