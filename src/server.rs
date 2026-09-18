@@ -33,6 +33,7 @@ fn run_listener(shared: Arc<AppShared>) {
         }
     };
     log::info!("被控端监听 0.0.0.0:{port}");
+    shared.server_ready.store(true, Ordering::Relaxed);
     shared.notify(format!("被控端已就绪（端口 {port}）"));
 
     for stream in listener.incoming() {

@@ -102,6 +102,7 @@ impl App {
             shared.device_id.clone(),
             shared.peers.clone(),
             shared.accepting.clone(),
+            shared.server_ready.clone(),
             shared.config.clone(),
             ctx.clone(),
         ) {
@@ -153,6 +154,12 @@ impl App {
                         created: Instant::now(),
                         resp,
                     });
+                    // 把主窗口提到前台：确认弹窗若藏在后台窗口里没人点，
+                    // 主控端就只能干等到超时，表现为「点了没反应」
+                    self.shared.ctx.send_viewport_cmd_to(
+                        egui::ViewportId::ROOT,
+                        egui::ViewportCommand::Focus,
+                    );
                 }
                 UiEvent::PasswordNeeded { req_id, peer, resp } => {
                     self.password_dialogs
@@ -247,11 +254,13 @@ impl App {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let accepting = self.shared.accepting.load(Ordering::Relaxed);
-                        theme::pill(
-                            ui,
-                            if accepting { "可被控制" } else { "已关闭被控" },
-                            if accepting { theme::SUCCESS } else { theme::TEXT_DIM },
-                        );
+                        let ready = self.shared.server_ready.load(Ordering::Relaxed);
+                        let (text, color) = match (accepting, ready) {
+                            (false, _) => ("已关闭被控", theme::TEXT_DIM),
+                            (true, false) => ("端口不可用", theme::DANGER),
+                            (true, true) => ("可被控制", theme::SUCCESS),
+                        };
+                        theme::pill(ui, text, color);
                     });
                 });
             });
@@ -454,10 +463,10 @@ impl App {
             if peer.accepting {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(theme::ghost_button("仅观看")).clicked() {
-                        crate::client::connect(self.shared.clone(), peer.addr, true, None);
+                        self.connect_to(peer, true);
                     }
                     if ui.add(theme::primary_button("控制")).clicked() {
-                        crate::client::connect(self.shared.clone(), peer.addr, false, None);
+                        self.connect_to(peer, false);
                     }
                 });
             } else {
@@ -515,9 +524,25 @@ impl App {
             });
     }
 
+    /// 发起连接。必须先给一个即时反馈：握手与对端人工确认可能耗时长，
+    /// 没有任何提示的话用户会以为「点了没反应」。
+    fn connect_to(&mut self, peer: &crate::discovery::Peer, view_only: bool) {
+        self.push_toast(
+            ToastKind::Info,
+            format!(
+                "正在连接 {}（{}:{}）…",
+                peer.name,
+                peer.addr.ip(),
+                peer.addr.port()
+            ),
+        );
+        crate::client::connect(self.shared.clone(), peer.addr, view_only, None);
+    }
+
     fn manual_connect(&mut self, view_only: bool) {
         match parse_addr(&self.manual_addr) {
             Some(addr) => {
+                self.push_toast(ToastKind::Info, format!("正在连接 {addr}…"));
                 crate::client::connect(self.shared.clone(), addr, view_only, None);
                 self.manual_addr.clear();
             }

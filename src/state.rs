@@ -22,6 +22,9 @@ pub struct AppShared {
     /// 允许被控制（总开关）。用 Arc 持有，便于直接交给发现线程共享，
     /// 否则广播里的 accepting 永远是构造时的初始值。
     pub accepting: Arc<AtomicBool>,
+    /// 被控端监听是否就绪。端口被占用时监听线程会退出，但广播仍在跑，
+    /// 若不区分，对端会看到一台「可被控制」却永远连不上的机器。
+    pub server_ready: Arc<AtomicBool>,
     /// 正在被控的会话数
     pub controlled_count: AtomicU64,
     /// 上次密码校验失败的时刻（epoch 毫秒），用于暴力破解冷却
@@ -44,6 +47,7 @@ impl AppShared {
             events_tx,
             ctx,
             accepting: Arc::new(AtomicBool::new(true)),
+            server_ready: Arc::new(AtomicBool::new(false)),
             controlled_count: AtomicU64::new(0),
             last_auth_fail_ms: AtomicU64::new(0),
             next_req_id: AtomicU64::new(1),

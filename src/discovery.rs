@@ -121,6 +121,7 @@ pub fn start_discovery(
     self_id: String,
     peers: PeerBook,
     accepting: Arc<AtomicBool>,
+    server_ready: Arc<AtomicBool>,
     config: Arc<Mutex<crate::config::Config>>,
     ctx: egui::Context,
 ) -> std::io::Result<Arc<AtomicBool>> {
@@ -137,13 +138,17 @@ pub fn start_discovery(
         let self_id = self_id.clone();
         let accepting = accepting.clone();
         let config = config.clone();
+        let server_ready = server_ready.clone();
         std::thread::Builder::new()
             .name("discovery-tx".into())
             .spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     let ann = {
                         let cfg = config.lock().unwrap();
-                        make_announce(&self_id, &cfg, accepting.load(Ordering::Relaxed))
+                        // 只有真正监听成功才对外宣称可被控制
+                        let online = accepting.load(Ordering::Relaxed)
+                            && server_ready.load(Ordering::Relaxed);
+                        make_announce(&self_id, &cfg, online)
                     };
                     if let Ok(json) = serde_json::to_vec(&ann) {
                         for target in &targets {

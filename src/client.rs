@@ -106,11 +106,12 @@ fn try_connect(
     password: Option<String>,
 ) -> Result<Arc<RemoteSession>, String> {
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("无法连接: {e}"))?;
+        .map_err(|e| format!("无法连接：{e}。请确认对端已运行、同一网段，且防火墙已放行其端口"))?;
     tune_stream(&stream);
     let mut stream = stream;
 
     // ---- 握手 ----
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let hello_out = Msg::Hello(protocol::Hello {
         protocol_version: protocol::PROTOCOL_VERSION,
         device_id: shared.device_id.clone(),
@@ -134,6 +135,8 @@ fn try_connect(
 
     // ---- 密码 ----
     if peer_hello.auth_required {
+        // 密码由用户在本机弹窗里输入，等待时间要充裕
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
         let password = match password {
             Some(p) => p,
             None => {
@@ -162,9 +165,19 @@ fn try_connect(
     // ---- 控制请求 ----
     protocol::write_msg(&mut stream, &Msg::RequestControl(protocol::RequestControl { view_only }))
         .map_err(|e| e.to_string())?;
+
+    // 对端会弹窗等人工确认，必须明确告诉用户去看对端，否则主控端
+    // 看起来就是「点了没反应」
+    shared.notify(format!(
+        "已向「{}」发起{}请求，请在对方设备上点「允许」",
+        peer_hello.name,
+        if view_only { "观看" } else { "控制" }
+    ));
+    // 与对端 90 秒确认超时对齐，留一点余量
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(95)));
     let result = match protocol::read_msg(&mut stream) {
         Ok(Msg::ControlResult(r)) => r,
-        _ => return Err("对端响应异常".into()),
+        _ => return Err("等待对方确认超时（90 秒）或响应异常".into()),
     };
     if !result.ok {
         return Err(result.message);
@@ -191,6 +204,9 @@ fn try_connect(
         let session = session.clone();
         let ctx = shared.ctx.clone();
         let mut reader = stream.try_clone().map_err(|e| e.to_string())?;
+        // 带超时才能周期回到循环顶部检查 session.closed，
+        // 否则断开后线程会一直阻塞在读上（此前无超时，线程泄漏）
+        let _ = reader.set_read_timeout(Some(Duration::from_secs(5)));
         std::thread::Builder::new()
             .name("lc-viewer-reader".into())
             .spawn(move || {
