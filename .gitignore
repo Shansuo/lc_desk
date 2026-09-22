@@ -2,6 +2,9 @@ target/
 dist/
 *.log
 
+# 图标生成产物（由 scripts/gen-icon.py 重新生成）
+scripts/icon-build/
+
 # 系统/编辑器
 .DS_Store
 Thumbs.db

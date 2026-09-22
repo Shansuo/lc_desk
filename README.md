@@ -19,12 +19,24 @@
 
 ### macOS
 
-从源码构建：
+在源码目录里一条命令装好（构建 → 打包 `LC-Deck.app` → 在桌面建快捷入口 → 启动）：
+
+```bash
+./scripts/install-local.sh            # 加 --no-run 则只安装不启动
+```
+
+它会装在 `~/Applications/LC-Deck.app`，桌面上的 `LC-Deck.app` 是指向它的符号链接。
+以后改了代码重新跑一次这个脚本即可，桌面入口不用重建。
+
+只构建、直接跑：
 
 ```bash
 cargo build --release
 ./target/release/lc_deck
 ```
+
+图标由 `scripts/gen-icon.py` 现算（纯 Python，无第三方依赖，配色取自 `src/theme.rs`），
+产物在 `scripts/icon-build/`，删掉即可重新生成。
 
 从 [GitHub Releases](../../releases) 下载 `lc_deck-v*-aarch64-apple-darwin.tar.gz`（Apple 芯片）
 或 `x86_64-apple-darwin`（Intel），解压后即可。
