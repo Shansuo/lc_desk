@@ -427,54 +427,11 @@ impl App {
     }
 
     fn peer_card(&mut self, ui: &mut Ui, peer: &crate::discovery::Peer) {
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::dot_glow(
-                    ui,
-                    if peer.accepting { theme::SUCCESS } else { theme::TEXT_FAINT },
-                    4.0,
-                );
-                ui.add_space(2.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(&peer.name)
-                            .size(14.5)
-                            .color(if peer.accepting { theme::TEXT } else { theme::TEXT_DIM })
-                            .strong(),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · {} · {}",
-                            peer.platform,
-                            peer.addr.ip(),
-                            peer.device_id
-                        ))
-                        .size(11.5)
-                        .color(theme::TEXT_FAINT),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::pill(ui, peer.platform.clone(), theme::TEXT_DIM);
-                });
-            });
-
-            ui.add_space(8.0);
-            if peer.accepting {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::ghost_button("仅观看")).clicked() {
-                        self.connect_to(peer, true);
-                    }
-                    if ui.add(theme::primary_button("控制")).clicked() {
-                        self.connect_to(peer, false);
-                    }
-                });
-            } else {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::pill(ui, "已关闭被控", theme::TEXT_DIM);
-                });
-            }
-        });
+        match draw_peer_card(ui, peer) {
+            PeerAction::Connect => self.connect_to(peer, false),
+            PeerAction::ViewOnly => self.connect_to(peer, true),
+            PeerAction::None => {}
+        }
     }
 
     // ---------------- 底部：手动连接 + 设置 + 权限 ----------------
@@ -1031,4 +988,192 @@ fn parse_addr(s: &str) -> Option<SocketAddr> {
 
 fn copy_text(ui: &Ui, text: String) {
     ui.ctx().copy_text(text);
+}
+
+// ---------------- 设备卡片 ----------------
+
+/// 设备卡片的绘制结果：把「怎么画」和「点了做什么」分开，卡片布局即可单测。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PeerAction {
+    None,
+    Connect,
+    ViewOnly,
+}
+
+/// 画一张设备卡片，返回用户点选的动作。
+///
+/// 布局上修掉了此前两个问题：
+///
+/// 1. **卡片被拉伸到整个列表视口高度。** 原实现是「两行 + 嵌套
+///    `with_layout(right_to_left)`」，`with_layout` 的子 Ui 以剩余可用空间为
+///    最大矩形，横向布局的十字轴居中会把这一整块高度算进自身尺寸。实测卡片
+///    高 171px（列表视口约 181px），按钮下方留下 50px 空白，更要命的是第 2、3
+///    台设备被压成 0 高度、内容总高又不超出视口所以连滚动条都不出现 ——
+///    发现到 3 台设备却只看得到 1 台。现在整卡是**单行**，高度只由内容决定。
+/// 2. **长设备名会把右侧操作区挤出卡片。** 现在先右后左分配：操作区先占位，
+///    信息区再吃剩余宽度，并对名称/详情做截断而不是换行。
+fn draw_peer_card(ui: &mut Ui, peer: &crate::discovery::Peer) -> PeerAction {
+    let mut action = PeerAction::None;
+
+    theme::card().show(ui, |ui| {
+        // 右对齐必须用 `with_layout(..., Align::Min)`。
+        //
+        // 这里踩过一个坑：用 `Align::Center`（以及 `with_layout` 的其它居中写法）
+        // 时，egui 会把「整块可用高度」算成该子布局的 frame 并 `expand_to_include_rect`，
+        // 于是卡片被拉伸到列表视口的高度（实测 900 高视口里卡片高 903）。
+        // 后果不只是卡片虚胖：第 2、3 台设备被压成 0 高度，内容总高又不超出视口，
+        // 连滚动条都不出现 —— 发现到 3 台设备却只看得到 1 台。
+        // `ui.horizontal()` / `Align::Min` 走的是有界路径，不会有这个问题。
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            // 右侧操作区先占位：否则长设备名会把按钮挤出卡片
+            if peer.accepting {
+                if ui.add(theme::primary_button("控制")).clicked() {
+                    action = PeerAction::Connect;
+                }
+                if ui.add(theme::ghost_button("仅观看")).clicked() {
+                    action = PeerAction::ViewOnly;
+                }
+            } else {
+                theme::pill(ui, "已关闭被控", theme::TEXT_DIM);
+            }
+
+            // 左侧信息区：第一行「状态点 + 设备名」，第二行详情（与名称左对齐）
+            let name_color = if peer.accepting { theme::TEXT } else { theme::TEXT_DIM };
+            let dot_color = if peer.accepting { theme::SUCCESS } else { theme::TEXT_FAINT };
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    theme::dot_glow(ui, dot_color, 4.0);
+                    ui.add_space(4.0);
+                    // truncate：设备名可能很长，宁可截断也不要换行把卡片撑高
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(peer.name.as_str()).size(14.5).color(name_color).strong(),
+                        )
+                        .truncate(),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    // 与名称左对齐（= 状态点宽度 16 + 间距 4）
+                    ui.add_space(20.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "{} · {} · {}",
+                                peer.platform,
+                                peer.addr.ip(),
+                                peer.device_id
+                            ))
+                            .size(11.5)
+                            .color(theme::TEXT_FAINT),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+        });
+    });
+
+    action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::Peer;
+
+    fn peer(name: &str, accepting: bool) -> Peer {
+        Peer {
+            device_id: "1DE5-883A".into(),
+            name: name.into(),
+            platform: "Windows".into(),
+            version: "0.1.11".into(),
+            addr: "192.168.0.20:48500".parse().unwrap(),
+            accepting,
+            last_seen: Instant::now(),
+        }
+    }
+
+    /// 在指定视口里渲染一张设备卡片，返回它实际占用的高度（逻辑像素）。
+    ///
+    /// 用 egui 的无头 Context 直接跑布局，不需要窗口，因此可以在单测里
+    /// 精确量出高度 —— 截图只能看出「不对劲」，这个能给出数字。
+    /// 跑一帧无头布局，把闭包的返回值带出来。
+    ///
+    /// 必须清理 `textures_delta`：epaint 在 drop 未处理的纹理增量时会 panic，
+    /// 无头测试没有后端来消费它。
+    fn run_frame<R>(viewport: egui::Vec2, f: impl FnOnce(&mut Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+            ..Default::default()
+        };
+        let mut f = Some(f);
+        let mut out = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            if let Some(f) = f.take() {
+                out = Some(f(ui));
+            }
+        });
+        output.textures_delta.clear();
+        out.expect("闭包必须执行一次")
+    }
+
+    /// 渲染一张设备卡片，返回它实际占用的高度（逻辑像素）。
+    ///
+    /// 用 egui 的无头 Context 直接跑布局，不需要窗口，因此可以在单测里
+    /// 精确量出高度 —— 截图只能看出「不对劲」，这个能给出数字。
+    fn card_height(viewport: egui::Vec2, name: &str, accepting: bool) -> f32 {
+        run_frame(viewport, |ui| {
+            let top = ui.cursor().top();
+            let _ = draw_peer_card(ui, &peer(name, accepting));
+            ui.cursor().top() - top
+        })
+    }
+
+    /// 卡片高度必须只由内容决定，不能随列表视口高度变化。
+    ///
+    /// 回归用例：旧布局下卡片会被拉伸到视口高度（420×900 的视口里高度
+    /// 接近 900），导致同一屏只能看到一台设备、其余被压成 0 高度。
+    #[test]
+    fn test_peer_card_height_is_content_driven() {
+        let tight = card_height(egui::vec2(420.0, 120.0), "DESKTOP-2RRTIEP", true);
+        let roomy = card_height(egui::vec2(420.0, 900.0), "DESKTOP-2RRTIEP", true);
+        assert!(
+            (tight - roomy).abs() < 1.0,
+            "卡片高度不能随视口变化：紧凑视口 {tight:.1}，宽裕视口 {roomy:.1}"
+        );
+        assert!(roomy < 80.0, "单行设备卡片应低于 80px，实际 {roomy:.1}");
+    }
+
+    /// 超长设备名不能把卡片撑高（必须走截断，而不是换行）。
+    #[test]
+    fn test_peer_card_survives_long_name() {
+        let long = "QIXUN-WORKSTATION-INTEL-XEON-一个特别特别长的设备名称测试用例";
+        let short = card_height(egui::vec2(420.0, 400.0), "DESK", true);
+        let tall = card_height(egui::vec2(420.0, 400.0), long, true);
+        assert!(
+            (tall - short).abs() < 1.0,
+            "长名称不应改变卡片高度：短名 {short:.1}，长名 {tall:.1}"
+        );
+    }
+
+    /// 关闭被控的卡片同样保持单行高度，并给出明确状态。
+    #[test]
+    fn test_peer_card_not_accepting_is_also_compact() {
+        let on = card_height(egui::vec2(420.0, 400.0), "DESKTOP-2RRTIEP", true);
+        let off = card_height(egui::vec2(420.0, 400.0), "DESKTOP-2RRTIEP", false);
+        assert!(off < 80.0, "不可控状态也应是单行，实际 {off:.1}");
+        assert!((on - off).abs() < 20.0, "两种状态高度不应差太多");
+    }
+
+
+    /// 窄窗口下也不能把内容挤到视口外（卡片宽度应受视口约束）。
+    #[test]
+    fn test_peer_card_fits_narrow_viewport() {
+        let width = run_frame(egui::vec2(360.0, 400.0), |ui| {
+            let _ = draw_peer_card(ui, &peer("DESKTOP-2RRTIEP", true));
+            ui.min_rect().width()
+        });
+        assert!(width <= 360.0, "卡片不应超出窗口宽度，实际 {width:.1}");
+    }
 }
