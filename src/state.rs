@@ -29,6 +29,9 @@ pub struct AppShared {
     pub controlled_count: AtomicU64,
     /// 上次密码校验失败的时刻（epoch 毫秒），用于暴力破解冷却
     pub last_auth_fail_ms: AtomicU64,
+    /// 最近一次收到键鼠输入的时刻（epoch 毫秒，0 = 本会话从未收到）。
+    /// 抓帧线程据此判断「用户正在操作」，从而临时解除帧率节流。
+    pub last_input_ms: Arc<AtomicU64>,
     next_req_id: AtomicU64,
 }
 
@@ -50,6 +53,7 @@ impl AppShared {
             server_ready: Arc::new(AtomicBool::new(false)),
             controlled_count: AtomicU64::new(0),
             last_auth_fail_ms: AtomicU64::new(0),
+            last_input_ms: Arc::new(AtomicU64::new(0)),
             next_req_id: AtomicU64::new(1),
         }
     }

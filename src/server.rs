@@ -5,7 +5,7 @@ use crate::input_exec::InputExecutor;
 use crate::protocol::{self, Msg};
 use crate::state::{tune_stream, AppShared, ControlledSession, UiEvent};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +14,9 @@ use std::time::Duration;
 const AUTH_COOLDOWN_MS: u64 = 1_500;
 /// 会话中读取对端消息的超时（仅用于让循环有机会检查停止标志）
 const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// 发送线程的等待步长。取得很短是为了让控制消息（Pong / 剪贴板 / Bye）
+/// 能及时插空发出：它们都很小，却直接决定交互手感与 RTT 读数。
+const WRITER_TICK: Duration = Duration::from_millis(5);
 
 /// 启动被控端监听线程。
 pub fn start_server(shared: Arc<AppShared>) -> std::thread::JoinHandle<()> {
@@ -260,8 +263,11 @@ fn session_loop(
         view_only: AtomicBool::new(view_only),
     });
 
+    // 最近一帧「抓帧 → 写出发送缓冲」的实测耗时，随 Pong 回填给主控端
+    let pipeline_ms = Arc::new(AtomicU32::new(0));
+
     // 帧通道（有界，最新帧优先：容量 1，编码完成即替换，避免排队积压延迟）
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(1);
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<capture::Frame>(1);
     // 传配置句柄而非快照：用户在设置里调整帧率/画质/宽度可实时生效
     let capture_stop = stop.clone();
     let notify = shared.clone();
@@ -269,6 +275,7 @@ fn session_loop(
         shared.config.clone(),
         frame_tx,
         capture_stop,
+        shared.last_input_ms.clone(),
         Box::new(move |text| notify.notify(text)),
     );
 
@@ -282,29 +289,14 @@ fn session_loop(
         }
     };
     let writer_stop = stop.clone();
+    let writer_pipeline = pipeline_ms.clone();
     let writer_handle = std::thread::Builder::new()
         .name("lc-conn-writer".into())
         .spawn(move || {
             while !writer_stop.load(Ordering::Relaxed) {
-                // 先发帧（带 50ms 等待）。收到后清空通道取最新帧，避免发送排队旧帧。
-                match frame_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(mut latest) => {
-                        while let Ok(newer) = frame_rx.try_recv() {
-                            latest = newer;
-                        }
-                        let (w, h, jpeg) = latest;
-                        if protocol::write_msg(
-                            &mut writer,
-                            &Msg::VideoFrame { width: w, height: h, jpeg },
-                        )
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
+                // 1) 控制消息优先。它们小且关乎交互：旧实现「先等帧、写完帧
+                //    才处理控制消息」，导致 Pong 被一整帧的发送耗时挡在后面，
+                //    界面 RTT 显示成真实链路的几十倍。
                 let mut alive = true;
                 while let Ok(msg) = ctl_rx.try_recv() {
                     if protocol::write_msg(&mut writer, &msg).is_err() {
@@ -314,6 +306,31 @@ fn session_loop(
                 }
                 if !alive {
                     break;
+                }
+
+                // 2) 再发最新一帧（清空通道取最新，避免排队旧帧）
+                match frame_rx.recv_timeout(WRITER_TICK) {
+                    Ok(mut latest) => {
+                        while let Ok(newer) = frame_rx.try_recv() {
+                            latest = newer;
+                        }
+                        let capture::Frame { width, height, jpeg, captured_ms } = latest;
+                        if protocol::write_msg(
+                            &mut writer,
+                            &Msg::VideoFrame { width, height, jpeg },
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                        // 被控端侧整段耗时：抓帧 → 写出发送缓冲。
+                        // 主控端收到的延迟里属于被控端的那一段，就是这个值。
+                        let cost = crate::platform::now_millis().saturating_sub(captured_ms);
+                        writer_pipeline
+                            .store(cost.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
             // 关键：无论是发送失败还是通道关闭退出，都必须点亮停止标志，
@@ -343,6 +360,9 @@ fn session_loop(
         match protocol::read_msg(&mut reader) {
             Ok(msg) => match msg {
                 Msg::Mouse(m) => {
+                    shared
+                        .last_input_ms
+                        .store(crate::platform::now_millis(), Ordering::Relaxed);
                     if !session.view_only.load(Ordering::Relaxed) {
                         if let Err(e) = executor.handle_mouse(&m) {
                             input_err = Some(e);
@@ -351,6 +371,9 @@ fn session_loop(
                     }
                 }
                 Msg::Wheel(w) => {
+                    shared
+                        .last_input_ms
+                        .store(crate::platform::now_millis(), Ordering::Relaxed);
                     if !session.view_only.load(Ordering::Relaxed) {
                         if let Err(e) = executor.handle_wheel(&w) {
                             input_err = Some(e);
@@ -359,6 +382,9 @@ fn session_loop(
                     }
                 }
                 Msg::Key(k) => {
+                    shared
+                        .last_input_ms
+                        .store(crate::platform::now_millis(), Ordering::Relaxed);
                     if !session.view_only.load(Ordering::Relaxed) {
                         if let Err(e) = executor.handle_key(&k) {
                             input_err = Some(e);
@@ -367,7 +393,10 @@ fn session_loop(
                     }
                 }
                 Msg::Ping(p) => {
-                    let _ = ctl_tx.send(Msg::Pong(p));
+                    let _ = ctl_tx.send(Msg::Pong(protocol::PingMsg {
+                        ts: p.ts,
+                        pipeline_ms: pipeline_ms.load(Ordering::Relaxed),
+                    }));
                 }
                 Msg::Clipboard(c) => {
                     crate::clipboard_sync::apply_incoming(&c.text);

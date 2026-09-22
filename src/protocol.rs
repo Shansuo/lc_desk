@@ -91,6 +91,10 @@ pub struct ClipboardMsg {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PingMsg {
     pub ts: u64,
+    /// 被控端回填的「抓帧 → 写出发送缓冲」实测耗时（毫秒）。
+    /// 旧版对端不认识该字段，缺失时按 0 处理，界面据此隐藏该项读数。
+    #[serde(default)]
+    pub pipeline_ms: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -252,8 +256,8 @@ mod tests {
             Msg::Key(KeyMsg { key: "enter".into(), down: true }),
             Msg::Key(KeyMsg { key: "界".into(), down: false }),
             Msg::Clipboard(ClipboardMsg { text: "剪贴板内容\n第二行".into() }),
-            Msg::Ping(PingMsg { ts: 1726000000123 }),
-            Msg::Pong(PingMsg { ts: 1726000000456 }),
+            Msg::Ping(PingMsg { ts: 1726000000123, pipeline_ms: 0 }),
+            Msg::Pong(PingMsg { ts: 1726000000456, pipeline_ms: 37 }),
             Msg::Bye(ByeMsg { reason: "用户断开".into() }),
         ];
         for m in msgs {
@@ -284,5 +288,15 @@ mod tests {
         buf.push(T_HELLO);
         let mut cursor = std::io::Cursor::new(buf);
         assert!(read_msg(&mut cursor).is_err());
+    }
+
+    /// 新增的 pipeline_ms 必须对旧版对端保持兼容：旧端发来的 JSON 里没有该字段，
+    /// 反序列化要落到 0（界面据此隐藏读数），而不是报错导致整条消息读失败。
+    #[test]
+    fn test_ping_without_pipeline_ms_is_accepted() {
+        let legacy = br#"{"ts":1726000000123}"#;
+        let parsed: PingMsg = serde_json::from_slice(legacy).expect("旧版 Ping 必须仍可解析");
+        assert_eq!(parsed.ts, 1726000000123);
+        assert_eq!(parsed.pipeline_ms, 0);
     }
 }

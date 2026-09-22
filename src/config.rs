@@ -7,8 +7,10 @@ use std::path::PathBuf;
 pub const DEFAULT_FPS: u32 = 24;
 pub const DEFAULT_QUALITY: u8 = 70;
 pub const DEFAULT_MAX_WIDTH: u32 = 1920;
-/// 帧率下限/上限（与设置面板滑条保持一致，避免多处硬编码漂移）
-pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=30;
+/// 帧率下限/上限（与设置面板滑条保持一致，避免多处硬编码漂移）。
+/// 上限提到 60：抓帧已改为「操作时不低于流水线速度」，高帧率设定在
+/// 快速拖动窗口等场景下才有意义。
+pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=60;
 pub const QUALITY_RANGE: std::ops::RangeInclusive<u8> = 30..=95;
 pub const MAX_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1280..=3840;
 

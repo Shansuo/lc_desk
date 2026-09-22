@@ -79,13 +79,36 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let stats = session.stats.lock().unwrap().clone();
                     ui.add_space(4.0);
-                    stat_chip(
-                        ui,
-                        &format!("{:.0} fps", stats.fps),
-                        fps_color(stats.fps),
-                    );
-                    stat_chip(ui, &format!("{:.0} ms", stats.rtt_ms), rtt_color(stats.rtt_ms));
-                    if stats.frame_w > 0 {
+                    stat_chip(ui, &format!("{:.0} fps", stats.fps), fps_color(stats.fps));
+
+                    // 延迟：被控端流水线 + 单程网络 + 本地解码，三段各自实测
+                    match stats.latency_estimate_ms() {
+                        Some(ms) => {
+                            stat_chip(ui, &format!("≈{ms:.0} ms"), rtt_color(ms)).on_hover_text(
+                                format!(
+                                    "预计总延迟 = 被控端 {:.0}ms（抓帧→写出）\n\
+                                     \u{20}         + 单程网络 {:.1}ms（RTT {:.1}ms）\n\
+                                     \u{20}         + 本地解码 {:.0}ms",
+                                    stats.server_pipeline_ms as f32,
+                                    stats.rtt_ms / 2.0,
+                                    stats.rtt_ms,
+                                    stats.decode_ms
+                                ),
+                            );
+                        }
+                        None => {
+                            stat_chip(ui, &format!("{:.0} ms", stats.rtt_ms), rtt_color(stats.rtt_ms))
+                                .on_hover_text(
+                                    "链路往返 RTT。对端为旧版本，未回填流水线耗时，暂时无法估算总延迟",
+                                );
+                        }
+                    }
+
+                    if stats.kbps > 0.0 {
+                        stat_chip(ui, &format!("↓{:.1}MB/s", stats.kbps / 1024.0), theme::TEXT_DIM)
+                            .on_hover_text("下行实测带宽。接近链路上限时说明瓶颈在画质/分辨率设置");
+                    }
+                    if stats.frame_w > 0 && ui.available_width() > 250.0 {
                         stat_chip(
                             ui,
                             &format!("{}×{}", stats.frame_w, stats.frame_h),
@@ -123,11 +146,14 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
             // 纹理更新
             {
                 let mut st = session.ui_state.lock().unwrap();
-                let tex = st.texture.get_or_insert_with(|| {
-                    ui.ctx().load_texture("remote", (*img).clone(), TextureOptions::LINEAR)
-                });
+                // 直接把 Arc 交给 egui（ImageData::Color 内部就是 Arc<ColorImage>），
+                // 避免每帧克隆一份全尺寸 ColorImage —— 1080p 就是 8MB 的纯拷贝，
+                // 4K 是 33MB，白白吃掉解码线程刚省下来的时间。
+                let tex = st
+                    .texture
+                    .get_or_insert_with(|| ui.ctx().load_texture("remote", img.clone(), TextureOptions::LINEAR));
                 if session.frame_dirty.swap(false, Ordering::Relaxed) {
-                    tex.set((*img).clone(), TextureOptions::LINEAR);
+                    tex.set(img.clone(), TextureOptions::LINEAR);
                 }
                 let tex_id = tex.id();
                 ui.painter().image(
@@ -195,13 +221,13 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
     }
 }
 
-/// 状态药丸（fps / RTT / 分辨率共用）。
-fn stat_chip(ui: &mut egui::Ui, text: &str, color: Color32) {
+/// 状态药丸（fps / 延迟 / 带宽 / 分辨率共用）。
+fn stat_chip(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_string(), FontId::proportional(11.5), color);
     let size = galley.size() + Vec2::new(14.0, 7.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter()
         .rect_filled(rect, theme::R_PILL, theme::tint(color, 44));
     ui.painter().galley(
@@ -209,6 +235,7 @@ fn stat_chip(ui: &mut egui::Ui, text: &str, color: Color32) {
         galley,
         color,
     );
+    resp
 }
 
 fn fps_color(fps: f32) -> Color32 {
@@ -267,7 +294,7 @@ fn flush_wheel(session: &RemoteSession) {
     }
     if dx != 0 || dy != 0 {
         drop(st);
-        let _ = session.input_tx.send(OutMsg::Wheel(crate::protocol::WheelMsg { dx, dy }));
+        session.push(OutMsg::Wheel(crate::protocol::WheelMsg { dx, dy }));
     }
 }
 
@@ -358,8 +385,7 @@ fn handle_input(ui: &mut egui::Ui, session: &Arc<RemoteSession>, rect: Rect) {
                     )
                 };
                 if dx != 0 || dy != 0 {
-                    let _ =
-                        session.input_tx.send(OutMsg::Wheel(crate::protocol::WheelMsg { dx, dy }));
+                    session.push(OutMsg::Wheel(crate::protocol::WheelMsg { dx, dy }));
                 }
             }
             Event::Text(t) => {
@@ -475,23 +501,17 @@ fn sync_mods(session: &Arc<RemoteSession>, m: &Modifiers) {
         st.last_mods[i] = want[i];
         let down = want[i];
         drop(st);
-        let _ = session
-            .input_tx
-            .send(OutMsg::Key(crate::protocol::KeyMsg { key: names[i].into(), down }));
+        let _ = session.push(OutMsg::Key(crate::protocol::KeyMsg { key: names[i].into(), down }));
         st = session.ui_state.lock().unwrap();
     }
 }
 
 fn send_key(session: &Arc<RemoteSession>, name: &str, down: bool) {
-    let _ = session
-        .input_tx
-        .send(OutMsg::Key(crate::protocol::KeyMsg { key: name.to_string(), down }));
+    let _ = session.push(OutMsg::Key(crate::protocol::KeyMsg { key: name.to_string(), down }));
 }
 
 fn send_mouse(session: &Arc<RemoteSession>, x: f32, y: f32, button: u8, action: u8) {
-    let _ = session
-        .input_tx
-        .send(OutMsg::Mouse(crate::protocol::MouseMsg { x, y, button, action }));
+    let _ = session.push(OutMsg::Mouse(crate::protocol::MouseMsg { x, y, button, action }));
 }
 
 #[cfg(test)]
