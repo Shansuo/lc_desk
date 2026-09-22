@@ -10,6 +10,61 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// 待上屏的绘制操作（解码线程产出，UI 线程消费）。
+#[derive(Clone, Debug)]
+pub enum PaintOp {
+    /// 整帧替换（首帧、分辨率变化、大范围变化）
+    Full(Arc<ColorImage>),
+    /// 局部更新：贴在整幅画面的 (x, y)
+    Patch(u32, u32, Arc<ColorImage>),
+}
+
+/// 绘制操作队列。
+///
+/// 增量帧的图块互不重叠，所以**同一格只需保留最后一块** —— 队列长度因此
+/// 有上界（1 个整帧 + 图块总数），既不会无限增长，也不会因为丢帧导致某块
+/// 永远停留在旧画面上（增量帧一旦丢失就无法自愈，所以这里一个都不能丢）。
+#[derive(Default)]
+pub struct PaintQueue {
+    ops: VecDeque<PaintOp>,
+}
+
+impl PaintQueue {
+    fn push_full(&mut self, img: Arc<ColorImage>) {
+        // 之前攒的图块是针对旧基准算出来的，整帧一到就全部作废
+        self.ops.clear();
+        self.ops.push_back(PaintOp::Full(img));
+    }
+
+    fn push_patch(&mut self, x: u32, y: u32, img: Arc<ColorImage>) {
+        for op in &mut self.ops {
+            if let PaintOp::Patch(px, py, existing) = op {
+                if *px == x && *py == y {
+                    *existing = img;
+                    return;
+                }
+            }
+        }
+        self.ops.push_back(PaintOp::Patch(x, y, img));
+    }
+
+    /// 取出全部待上屏操作（按到达顺序）。
+    pub fn take_all(&mut self) -> Vec<PaintOp> {
+        self.ops.drain(..).collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ops.len()
+    }
+}
+
+/// 解码任务：整帧，或一批增量图块。
+enum DecodeJob {
+    Full { width: u32, height: u32, jpeg: Vec<u8> },
+    Rects { rects: Vec<protocol::RectBlock> },
+}
+
 /// 发往主控端 writer 线程的出站消息
 #[derive(Debug)]
 pub enum OutMsg {
@@ -129,9 +184,10 @@ impl SessionStats {
 pub struct RemoteSession {
     pub id: u64,
     pub peer_name: String,
-    /// 最新解码帧
+    /// 最近一次整帧（新建/重建纹理的基准，也用来确定画面尺寸）
     pub frame: Arc<Mutex<Option<Arc<ColorImage>>>>,
-    pub frame_dirty: AtomicBool,
+    /// 待上屏的增量操作
+    pub paint: Mutex<PaintQueue>,
     pub stats: Arc<Mutex<SessionStats>>,
     outbox: Outbox,
     pub view_only: AtomicBool,
@@ -231,7 +287,7 @@ fn try_connect(
     });
     protocol::write_msg(&mut stream, &hello_out).map_err(|e| e.to_string())?;
     let peer_hello = match protocol::read_msg(&mut stream) {
-        Ok(Msg::Hello(h)) if h.protocol_version == protocol::PROTOCOL_VERSION => h,
+        Ok(Msg::Hello(h)) if protocol::version_compatible(h.protocol_version) => h,
         Ok(Msg::Hello(h)) => {
             return Err(format!(
                 "协议版本不兼容（对端 v{}，本机 v{}）",
@@ -298,7 +354,7 @@ fn try_connect(
         id: session_id,
         peer_name: peer_hello.name.clone(),
         frame: Arc::new(Mutex::new(None)),
-        frame_dirty: AtomicBool::new(false),
+        paint: Mutex::new(PaintQueue::default()),
         stats: Arc::new(Mutex::new(SessionStats::default())),
         outbox: Outbox::default(),
         view_only: AtomicBool::new(view_only),
@@ -313,7 +369,7 @@ fn try_connect(
     // 内核接收缓冲里会堆着后续几帧。缓冲里的旧帧必须逐帧解码完才能轮到
     // 最新的那帧，客户端越慢延迟越高。拆开之后读循环始终把缓冲抽干，
     // 解码线程只保留最新帧，未解码的旧帧直接丢弃。
-    let (raw_tx, raw_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(1);
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<DecodeJob>(1);
     {
         let session = session.clone();
         let mut reader = stream.try_clone().map_err(|e| e.to_string())?;
@@ -333,16 +389,28 @@ fn try_connect(
                     match protocol::read_msg(&mut reader) {
                         Ok(Msg::VideoFrame { width, height, jpeg }) => {
                             bw_bytes += jpeg.len();
-                            let elapsed = bw_start.elapsed();
-                            if elapsed >= Duration::from_millis(1000) {
-                                let kbps = bw_bytes as f32 / 1024.0 / elapsed.as_secs_f32();
-                                session.stats.lock().unwrap().kbps = kbps;
-                                bw_bytes = 0;
-                                bw_start = Instant::now();
+                            count_bandwidth(&session, &mut bw_bytes, &mut bw_start);
+                            // 阻塞投递：增量帧不能丢（见 PaintQueue 说明），
+                            // 这里统一用背压保证完整送达。
+                            if raw_tx
+                                .send(DecodeJob::Full { width, height, jpeg })
+                                .is_err()
+                            {
+                                return;
                             }
-                            // 通道满说明解码还没跟上，直接丢掉这一帧：
-                            // 留着的旧帧只会让画面更旧。
-                            let _ = raw_tx.try_send((width, height, jpeg));
+                        }
+                        Ok(Msg::FrameRects { width, height, rects }) => {
+                            bw_bytes += rects.iter().map(|r| r.jpeg.len()).sum::<usize>();
+                            count_bandwidth(&session, &mut bw_bytes, &mut bw_start);
+                            // 画面尺寸可能变化（首帧之后一般不变），更新一下
+                            {
+                                let mut stats = session.stats.lock().unwrap();
+                                stats.frame_w = width;
+                                stats.frame_h = height;
+                            }
+                            if raw_tx.send(DecodeJob::Rects { rects }).is_err() {
+                                return;
+                            }
                         }
                         Ok(Msg::Pong(p)) => {
                             let rtt = now_millis().saturating_sub(p.ts) as f32;
@@ -389,21 +457,50 @@ fn try_connect(
                         break;
                     }
                     match raw_rx.recv_timeout(Duration::from_millis(300)) {
-                        Ok((width, height, jpeg)) => {
+                        Ok(job) => {
                             let started = Instant::now();
-                            let Some(img) = decode_jpeg(&jpeg, width, height) else {
-                                continue;
+                            let ok = match job {
+                                DecodeJob::Full { width, height, jpeg } => {
+                                    match decode_jpeg(&jpeg, width, height) {
+                                        Some(img) => {
+                                            let img = Arc::new(img);
+                                            *session.frame.lock().unwrap() = Some(img.clone());
+                                            {
+                                                let mut stats = session.stats.lock().unwrap();
+                                                stats.frame_w = width;
+                                                stats.frame_h = height;
+                                            }
+                                            session.paint.lock().unwrap().push_full(img);
+                                            true
+                                        }
+                                        None => false,
+                                    }
+                                }
+                                DecodeJob::Rects { rects } => {
+                                    // 只解码变化的图块：整帧解码 1080p 要 7.6ms，
+                                    // 而几个 128px 图块不到 1ms
+                                    let mut painted = 0;
+                                    {
+                                        let q = &mut *session.paint.lock().unwrap();
+                                        for r in rects {
+                                            if let Some(img) = decode_jpeg(&r.jpeg, r.w, r.h) {
+                                                q.push_patch(r.x, r.y, Arc::new(img));
+                                                painted += 1;
+                                            }
+                                        }
+                                    }
+                                    painted > 0
+                                }
                             };
+                            if !ok {
+                                continue;
+                            }
                             let decode_ms = started.elapsed().as_secs_f32() * 1000.0;
-                            *session.frame.lock().unwrap() = Some(Arc::new(img));
-                            session.frame_dirty.store(true, Ordering::Relaxed);
 
                             let now = Instant::now();
                             frame_times.retain(|t| now.duration_since(*t).as_secs_f32() < 2.0);
                             frame_times.push(now);
                             let mut stats = session.stats.lock().unwrap();
-                            stats.frame_w = width;
-                            stats.frame_h = height;
                             stats.fps = frame_times.len() as f32 / 2.0;
                             stats.decode_ms = if stats.decode_ms == 0.0 {
                                 decode_ms
@@ -499,6 +596,17 @@ fn try_connect(
     Ok(session)
 }
 
+/// 累计到 1 秒就更新一次带宽读数。
+fn count_bandwidth(session: &RemoteSession, bytes: &mut usize, start: &mut Instant) {
+    let elapsed = start.elapsed();
+    if elapsed >= Duration::from_millis(1000) {
+        let kbps = *bytes as f32 / 1024.0 / elapsed.as_secs_f32();
+        session.stats.lock().unwrap().kbps = kbps;
+        *bytes = 0;
+        *start = Instant::now();
+    }
+}
+
 /// 写出一条出站消息。返回 false 表示发送线程应当结束（收到 Bye 或写入失败）。
 fn send_out(writer: &mut TcpStream, session: &RemoteSession, out: OutMsg) -> bool {
     let msg = match out {
@@ -518,7 +626,7 @@ fn send_out(writer: &mut TcpStream, session: &RemoteSession, out: OutMsg) -> boo
     true
 }
 
-fn decode_jpeg(jpeg: &[u8], w: u32, h: u32) -> Option<ColorImage> {
+pub(crate) fn decode_jpeg(jpeg: &[u8], w: u32, h: u32) -> Option<ColorImage> {
     let img = image::load_from_memory(jpeg).ok()?;
     // JPEG 解码结果本就是 RGB，into_rgb8 直接接管解码缓冲（不复制像素），
     // 再由 from_rgb 一次转成 Color32。旧写法先 to_rgba8 再
@@ -654,6 +762,107 @@ mod tests {
         }
         assert_eq!(n, HARD_CAP, "硬上限必须生效，否则队列与延迟都会无限增长");
         assert_eq!(first, format!("k{}", 100), "丢的必须是最早的旧输入");
+    }
+
+    fn img(w: usize, h: usize, v: u8) -> Arc<ColorImage> {
+        Arc::new(ColorImage::filled([w, h], egui::Color32::from_rgb(v, v, v)))
+    }
+
+    /// 同一格的图块只保留最后一块：队列长度因此有上界，且画面不会停在旧帧上。
+    #[test]
+    fn test_paint_queue_coalesces_same_tile() {
+        let mut q = PaintQueue::default();
+        for i in 0..50u8 {
+            q.push_patch(128, 128, img(128, 128, i));
+        }
+        let ops = q.take_all();
+        assert_eq!(ops.len(), 1, "同一格的 50 次更新应合并为 1 条");
+        match &ops[0] {
+            PaintOp::Patch(x, y, im) => {
+                assert_eq!((*x, *y), (128, 128));
+                assert_eq!(
+                    im.pixels[0],
+                    egui::Color32::from_rgb(49, 49, 49),
+                    "必须保留最后一块"
+                );
+            }
+            other => panic!("类型错误: {other:?}"),
+        }
+    }
+
+    /// 整帧一到，之前攒的图块必须作废（它们是按旧基准算出来的）。
+    #[test]
+    fn test_paint_queue_full_discards_stale_patches() {
+        let mut q = PaintQueue::default();
+        q.push_patch(0, 0, img(8, 8, 1));
+        q.push_patch(128, 0, img(8, 8, 2));
+        q.push_full(img(64, 64, 9));
+        let ops = q.take_all();
+        assert_eq!(ops.len(), 1, "整帧应清空先前攒下的图块");
+        assert!(matches!(ops[0], PaintOp::Full(_)));
+    }
+
+    /// 整帧之后的图块必须保留并按顺序排在整帧之后。
+    #[test]
+    fn test_paint_queue_patches_after_full_are_kept() {
+        let mut q = PaintQueue::default();
+        q.push_full(img(256, 256, 0));
+        q.push_patch(0, 0, img(8, 8, 5));
+        q.push_patch(128, 128, img(8, 8, 6));
+        let ops = q.take_all();
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], PaintOp::Full(_)), "整帧必须在最前");
+        assert!(matches!(ops[1], PaintOp::Patch(0, 0, _)));
+        assert!(matches!(ops[2], PaintOp::Patch(128, 128, _)));
+    }
+
+    /// 图块互不重叠，队列长度上界 = 1 整帧 + 图块数，不会无限增长。
+    #[test]
+    fn test_paint_queue_is_bounded() {
+        let mut q = PaintQueue::default();
+        q.push_full(img(256, 256, 0));
+        // 4×4 网格反复更新 200 轮
+        for round in 0..200u8 {
+            for ty in 0..4 {
+                for tx in 0..4 {
+                    q.push_patch(tx * 64, ty * 64, img(64, 64, round));
+                }
+            }
+        }
+        assert_eq!(q.len(), 1 + 16, "队列长度应稳定在 1 整帧 + 16 块");
+    }
+
+    /// 图块「编码 → 解码」必须能对出一样的内容，否则局部更新会把画面贴花。
+    #[test]
+    fn test_tile_encode_decode_roundtrip() {
+        use image::codecs::jpeg::JpegEncoder;
+        let (tw, th) = (128u32, 128u32);
+        // 造一块渐变（模拟真实画面）
+        let mut rgb = Vec::with_capacity((tw * th * 3) as usize);
+        for y in 0..th {
+            for x in 0..tw {
+                rgb.push((x % 200) as u8);
+                rgb.push((y % 200) as u8);
+                rgb.push(((x + y) % 180) as u8);
+            }
+        }
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 70)
+            .encode(&rgb, tw, th, image::ExtendedColorType::Rgb8)
+            .unwrap();
+
+        let decoded = decode_jpeg(&jpeg, tw, th).expect("图块应能解码");
+        assert_eq!(decoded.size, [tw as usize, th as usize], "尺寸必须一致");
+
+        // JPEG 有损，比较平均误差而不是逐像素相等
+        let mut diff = 0.0f32;
+        for (p, src) in decoded.pixels.iter().zip(rgb.chunks_exact(3)) {
+            diff += (p.r() as i32 - src[0] as i32).unsigned_abs() as f32;
+            diff += (p.g() as i32 - src[1] as i32).unsigned_abs() as f32;
+            diff += (p.b() as i32 - src[2] as i32).unsigned_abs() as f32;
+        }
+        let avg = diff / (decoded.pixels.len() as f32 * 3.0);
+        assert!(avg < 6.0, "q70 图块平均误差应很小，实际 {avg:.2}");
     }
 
     /// 延迟估算必须把三段相加；旧版对端（无流水线耗时）应返回 None 而不是瞎猜。

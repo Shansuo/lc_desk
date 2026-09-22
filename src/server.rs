@@ -150,7 +150,16 @@ fn handle_conn(shared: Arc<AppShared>, stream: TcpStream) {
 
 fn read_expect_hello(reader: &mut TcpStream) -> Option<protocol::Hello> {
     match protocol::read_msg(reader) {
-        Ok(Msg::Hello(h)) => Some(h),
+        Ok(Msg::Hello(h)) if protocol::version_compatible(h.protocol_version) => Some(h),
+        Ok(Msg::Hello(h)) => {
+            // 版本不兼容只能断连：帧格式可能已变化，硬撑会给出花屏
+            log::warn!(
+                "对端协议版本 v{} 与本机 v{} 不兼容，拒绝连接",
+                h.protocol_version,
+                protocol::PROTOCOL_VERSION
+            );
+            None
+        }
         Ok(_) => None,
         Err(e) => {
             log::debug!("读取 Hello 失败: {e}");
@@ -271,11 +280,14 @@ fn session_loop(
     // 传配置句柄而非快照：用户在设置里调整帧率/画质/宽度可实时生效
     let capture_stop = stop.clone();
     let notify = shared.clone();
+    // 对端支持增量帧时才启用图块差分；否则一律整帧（旧版主控端兼容）
+    let rects_enabled = protocol::supports_rects(hello.protocol_version);
     let capture_handle = capture::spawn_capture(
         shared.config.clone(),
         frame_tx,
         capture_stop,
         shared.last_input_ms.clone(),
+        rects_enabled,
         Box::new(move |text| notify.notify(text)),
     );
 
@@ -308,19 +320,25 @@ fn session_loop(
                     break;
                 }
 
-                // 2) 再发最新一帧（清空通道取最新，避免排队旧帧）
+                // 2) 再发一帧。
+                //
+                //    注意这里**不能**像以前那样「清空通道只留最新一帧」：
+                //    增量帧每一帧只带变化的图块，丢掉中间任何一帧，主控端就
+                //    永远缺那块内容。整帧可以丢旧的取新的，图块不行。
+                //    上游已改为阻塞式背压（见 capture.rs），所以这里按顺序
+                //    逐帧发出即可，不会积压。
                 match frame_rx.recv_timeout(WRITER_TICK) {
-                    Ok(mut latest) => {
-                        while let Ok(newer) = frame_rx.try_recv() {
-                            latest = newer;
-                        }
-                        let capture::Frame { width, height, jpeg, captured_ms } = latest;
-                        if protocol::write_msg(
-                            &mut writer,
-                            &Msg::VideoFrame { width, height, jpeg },
-                        )
-                        .is_err()
-                        {
+                    Ok(latest) => {
+                        let capture::Frame { width, height, kind, captured_ms } = latest;
+                        let msg = match kind {
+                            capture::FrameKind::Full { jpeg } => {
+                                Msg::VideoFrame { width, height, jpeg }
+                            }
+                            capture::FrameKind::Rects { rects } => {
+                                Msg::FrameRects { width, height, rects }
+                            }
+                        };
+                        if protocol::write_msg(&mut writer, &msg).is_err() {
                             break;
                         }
                         // 被控端侧整段耗时：抓帧 → 写出发送缓冲。

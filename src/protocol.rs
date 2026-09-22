@@ -7,7 +7,11 @@ use std::io::{self, Read, Write};
 pub const TCP_DEFAULT_PORT: u16 = 48500;
 pub const UDP_DISCOVERY_PORT: u16 = 48501;
 /// 协议版本：写入 Hello 握手，不兼容时由对端拒绝连接。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+/// 能接受的最低对端版本。1 = v0.1.12 及更早（只有整帧）。
+pub const PROTOCOL_MIN_VERSION: u32 = 1;
+/// 达到该版本才支持「脏矩形增量更新」，否则一律发整帧。
+pub const PROTOCOL_RECTS_MIN: u32 = 2;
 /// 单条消息上限。4K JPEG 帧实测约 1~2MB，16MB 已有 8 倍余量；
 /// 上限同时是「未读内容就分配内存」的上界，过大会被异常/恶意对端打爆内存。
 pub const MAX_MSG_LEN: u32 = 16 * 1024 * 1024;
@@ -25,6 +29,8 @@ const T_CLIPBOARD: u8 = 10;
 const T_PING: u8 = 11;
 const T_PONG: u8 = 12;
 const T_BYE: u8 = 13;
+/// 增量帧：一帧里只带发生变化的图块（见 [`FrameRects`]）。
+const T_FRAME_RECTS: u8 = 14;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Hello {
@@ -102,6 +108,20 @@ pub struct ByeMsg {
     pub reason: String,
 }
 
+/// 一个发生变化的图块。坐标与尺寸为**缩放后画面**的像素，
+/// 主控端可直接按此坐标局部更新纹理。
+///
+/// 走二进制编码而不是 JSON：热路径上每帧可能有上百个块，
+/// JSON 的解析与临时字符串分配都太贵。
+#[derive(Clone, Debug)]
+pub struct RectBlock {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub jpeg: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Msg {
     Hello(Hello),
@@ -110,6 +130,9 @@ pub enum Msg {
     RequestControl(RequestControl),
     ControlResult(ControlResult),
     VideoFrame { width: u32, height: u32, jpeg: Vec<u8> },
+    /// 增量帧：本帧只有 `rects` 里的这些图块发生变化。
+    /// `width`/`height` 为整幅画面尺寸（主控端据此确定纹理大小）。
+    FrameRects { width: u32, height: u32, rects: Vec<RectBlock> },
     Mouse(MouseMsg),
     Wheel(WheelMsg),
     Key(KeyMsg),
@@ -128,6 +151,7 @@ impl Msg {
             Msg::RequestControl(_) => T_REQUEST_CONTROL,
             Msg::ControlResult(_) => T_CONTROL_RESULT,
             Msg::VideoFrame { .. } => T_VIDEO_FRAME,
+            Msg::FrameRects { .. } => T_FRAME_RECTS,
             Msg::Mouse(_) => T_MOUSE,
             Msg::Wheel(_) => T_WHEEL,
             Msg::Key(_) => T_KEY,
@@ -150,6 +174,22 @@ impl Msg {
                 buf.extend_from_slice(&width.to_le_bytes());
                 buf.extend_from_slice(&height.to_le_bytes());
                 buf.extend_from_slice(jpeg);
+                buf
+            }
+            Msg::FrameRects { width, height, rects } => {
+                let bytes: usize = rects.iter().map(|r| 20 + r.jpeg.len()).sum();
+                let mut buf = Vec::with_capacity(12 + bytes);
+                buf.extend_from_slice(&width.to_le_bytes());
+                buf.extend_from_slice(&height.to_le_bytes());
+                buf.extend_from_slice(&(rects.len() as u32).to_le_bytes());
+                for r in rects {
+                    buf.extend_from_slice(&r.x.to_le_bytes());
+                    buf.extend_from_slice(&r.y.to_le_bytes());
+                    buf.extend_from_slice(&r.w.to_le_bytes());
+                    buf.extend_from_slice(&r.h.to_le_bytes());
+                    buf.extend_from_slice(&(r.jpeg.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&r.jpeg);
+                }
                 buf
             }
             Msg::Mouse(m) => serde_json::to_vec(m).map_err(io_err)?,
@@ -177,6 +217,39 @@ impl Msg {
                 let height = u32::from_le_bytes(payload[4..8].try_into().unwrap());
                 Msg::VideoFrame { width, height, jpeg: payload[8..].to_vec() }
             }
+            T_FRAME_RECTS => {
+                if payload.len() < 12 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "rect frame too short"));
+                }
+                let width = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                let height = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                let count = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+                let mut rects = Vec::with_capacity(count.min(1024));
+                let mut pos = 12usize;
+                for _ in 0..count {
+                    if pos + 20 > payload.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rect frame truncated",
+                        ));
+                    }
+                    let x = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+                    let y = u32::from_le_bytes(payload[pos + 4..pos + 8].try_into().unwrap());
+                    let w = u32::from_le_bytes(payload[pos + 8..pos + 12].try_into().unwrap());
+                    let h = u32::from_le_bytes(payload[pos + 12..pos + 16].try_into().unwrap());
+                    let len = u32::from_le_bytes(payload[pos + 16..pos + 20].try_into().unwrap()) as usize;
+                    pos += 20;
+                    if pos + len > payload.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rect jpeg truncated",
+                        ));
+                    }
+                    rects.push(RectBlock { x, y, w, h, jpeg: payload[pos..pos + len].to_vec() });
+                    pos += len;
+                }
+                Msg::FrameRects { width, height, rects }
+            }
             T_MOUSE => Msg::Mouse(parse(&payload)?),
             T_WHEEL => Msg::Wheel(parse(&payload)?),
             T_KEY => Msg::Key(parse(&payload)?),
@@ -196,6 +269,19 @@ fn parse<T: serde::de::DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
 
 fn io_err(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+/// 对端版本是否支持脏矩形增量更新。
+///
+/// 被控端据此决定发整帧还是增量帧：对方是 v0.1.12 及更早的版本时
+/// 只能发整帧，否则对端会读不出画面。
+pub fn supports_rects(peer_version: u32) -> bool {
+    peer_version >= PROTOCOL_RECTS_MIN && peer_version <= PROTOCOL_VERSION
+}
+
+/// 对端版本能否互通（握手时校验）。
+pub fn version_compatible(peer_version: u32) -> bool {
+    peer_version >= PROTOCOL_MIN_VERSION && peer_version <= PROTOCOL_VERSION
 }
 
 pub fn write_msg<W: Write>(w: &mut W, msg: &Msg) -> io::Result<()> {
@@ -251,6 +337,14 @@ mod tests {
             Msg::RequestControl(RequestControl { view_only: false }),
             Msg::ControlResult(ControlResult { ok: false, message: "拒绝".into() }),
             Msg::VideoFrame { width: 1920, height: 1080, jpeg: vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3] },
+            Msg::FrameRects {
+                width: 1920,
+                height: 1080,
+                rects: vec![
+                    RectBlock { x: 0, y: 0, w: 128, h: 128, jpeg: vec![0xFF, 0xD8, 0xFF] },
+                    RectBlock { x: 128, y: 256, w: 128, h: 128, jpeg: vec![1, 2, 3, 4, 5] },
+                ],
+            },
             Msg::Mouse(MouseMsg { x: 0.5, y: 0.25, button: 0, action: 1 }),
             Msg::Wheel(WheelMsg { dx: -2, dy: 3 }),
             Msg::Key(KeyMsg { key: "enter".into(), down: true }),
@@ -288,6 +382,65 @@ mod tests {
         buf.push(T_HELLO);
         let mut cursor = std::io::Cursor::new(buf);
         assert!(read_msg(&mut cursor).is_err());
+    }
+
+    /// 增量帧必须能原样往返：主控端靠它只更新变化区域，坐标错了画面就花了。
+    #[test]
+    fn test_frame_rects_roundtrip() {
+        let rects = vec![
+            RectBlock { x: 0, y: 0, w: 128, h: 128, jpeg: vec![0xFF, 0xD8, 0xFF] },
+            RectBlock { x: 640, y: 512, w: 128, h: 96, jpeg: vec![9, 8, 7, 6] },
+        ];
+        let msg = Msg::FrameRects { width: 1920, height: 1080, rects: rects.clone() };
+        match roundtrip(msg) {
+            Msg::FrameRects { width, height, rects: got } => {
+                assert_eq!((width, height), (1920, 1080));
+                assert_eq!(got.len(), 2);
+                for (a, b) in rects.iter().zip(got.iter()) {
+                    assert_eq!((a.x, a.y, a.w, a.h), (b.x, b.y, b.w, b.h));
+                    assert_eq!(a.jpeg, b.jpeg);
+                }
+            }
+            other => panic!("类型错误: {other:?}"),
+        }
+    }
+
+    /// 零图块也要能正常编码/解码（没有变化时的“空帧”）。
+    #[test]
+    fn test_frame_rects_empty() {
+        let msg = Msg::FrameRects { width: 800, height: 600, rects: Vec::new() };
+        match roundtrip(msg) {
+            Msg::FrameRects { rects, .. } => assert!(rects.is_empty()),
+            other => panic!("类型错误: {other:?}"),
+        }
+    }
+
+    /// 截断的增量帧必须报错而不是 panic 或读到半张图。
+    #[test]
+    fn test_frame_rects_truncated_rejected() {
+        let mut buf = Vec::new();
+        let msg = Msg::FrameRects {
+            width: 100,
+            height: 100,
+            rects: vec![RectBlock { x: 0, y: 0, w: 8, h: 8, jpeg: vec![1, 2, 3, 4] }],
+        };
+        write_msg(&mut buf, &msg).unwrap();
+        // 砍掉末尾 2 字节，让最后一个 jpeg 不完整
+        buf.truncate(buf.len() - 2);
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(read_msg(&mut cursor).is_err());
+    }
+
+    /// 版本协商：旧版对端能连上但只能发整帧。
+    #[test]
+    fn test_version_gating() {
+        assert!(version_compatible(1), "v0.1.12 及更早必须还能连上");
+        assert!(version_compatible(2));
+        assert!(!version_compatible(0));
+        assert!(!version_compatible(3), "比本机更新的版本不兼容");
+
+        assert!(!supports_rects(1), "旧版只能收整帧");
+        assert!(supports_rects(2));
     }
 
     /// 新增的 pipeline_ms 必须对旧版对端保持兼容：旧端发来的 JSON 里没有该字段，

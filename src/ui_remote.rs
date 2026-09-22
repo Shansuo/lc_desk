@@ -1,6 +1,6 @@
 //! 远控视口：显示远端画面，捕获并转发键鼠输入。
 
-use crate::client::{OutMsg, RemoteSession};
+use crate::client::{OutMsg, PaintOp, RemoteSession};
 use crate::keys;
 use crate::theme;
 use egui::{
@@ -152,8 +152,25 @@ pub fn show(ui: &mut egui::Ui, session: &Arc<RemoteSession>) {
                 let tex = st
                     .texture
                     .get_or_insert_with(|| ui.ctx().load_texture("remote", img.clone(), TextureOptions::LINEAR));
-                if session.frame_dirty.swap(false, Ordering::Relaxed) {
-                    tex.set(img.clone(), TextureOptions::LINEAR);
+
+                // 只把变化的矩形贴上去：整帧上传要 8MB（4K 33MB），
+                // 而几个 128px 图块只有几十 KB。
+                for op in session.paint.lock().unwrap().take_all() {
+                    match op {
+                        PaintOp::Full(f) => tex.set(f, TextureOptions::LINEAR),
+                        PaintOp::Patch(x, y, patch) => {
+                            let [tw, th] = tex.size();
+                            let (pw, ph) = (patch.width(), patch.height());
+                            // 越界的块跳过（例如分辨率刚变、纹理尚未重建）
+                            if x as usize + pw <= tw && y as usize + ph <= th {
+                                tex.set_partial(
+                                    [x as usize, y as usize],
+                                    patch,
+                                    TextureOptions::LINEAR,
+                                );
+                            }
+                        }
+                    }
                 }
                 let tex_id = tex.id();
                 ui.painter().image(
