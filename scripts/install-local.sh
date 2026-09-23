@@ -17,7 +17,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$ROOT/target/release/lc_deck"
-APPS="$HOME/Applications"
+# 优先装到 /Applications：启动台 / Spotlight / Dock 只索引那里。
+# 装到 ~/Applications 会出现「Dock 图标指向另一份旧版」的问题
+# （本机就踩过：Dock 指向 /Applications 的 v0.1.10，而新版本在 ~/Applications）。
+APPS="/Applications"
+if [[ ! -w "$APPS" ]]; then
+  APPS="$HOME/Applications"
+fi
 APP="$APPS/LC-Deck.app"
 DESKTOP="$HOME/Desktop"
 ENTRY="$DESKTOP/LC-Deck.app"
